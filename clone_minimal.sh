@@ -38,8 +38,11 @@ if [[ "$OP" =~ ^[Cc]$ ]]; then
   read -rp "Select TARGET number: " DST_IDX
 fi
 
-if ! [[ "$SRC_IDX" =~ ^[0-9]+$ ]] || ! [[ "$DST_IDX" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: selections must be numbers"; exit 1
+if ! [[ "$SRC_IDX" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: source selection must be a number"; exit 1
+fi
+if [[ "$OP" =~ ^[Cc]$ ]] && ! [[ "$DST_IDX" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: target selection must be a number"; exit 1
 fi
 
 SRC_IDX=$((SRC_IDX-1))
@@ -91,11 +94,86 @@ if [[ "$OP" =~ ^[Cc]$ ]]; then
   read -rp "Type YES to confirm clone: " CONFIRM
   [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
-  # Default archive name to current dir with source device basename
+  # Choose destination drive (mounted) and path for archive
   SRC_BASENAME=$(basename "$SRC")
-  read -rp "Enter archive output file [default ./${SRC_BASENAME}.img.gz]: " ARCH
-  ARCH=${ARCH:-./${SRC_BASENAME}.img.gz}
-  if [ -e "$ARCH" ]; then read -rp "File exists. Overwrite? (y/N): " OW; [[ "$OW" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }; fi
+  echo "=== Choose drive to SAVE the archive on ==="
+  # Collect mounted destinations on real disks only (exclude loop devices)
+  # Use entries where TYPE=part, MOUNTPOINT != empty, and parent disk PKNAME is sdX or nvme*n1
+  mapfile -t MOUNTED < <(lsblk -ln -o NAME,TYPE,MOUNTPOINT,PKNAME | \
+    awk '$2=="part" && $3!="" && ($4 ~ /^sd[a-z]+$/ || $4 ~ /^nvme[0-9]+n[0-9]+$/) {print $1" "$3}' | sort -k2,2 -u)
+  if [ ${#MOUNTED[@]} -eq 0 ]; then
+    echo "No mounted destinations found. Please mount a drive and retry."; exit 1
+  fi
+  for i in "${!MOUNTED[@]}"; do
+    DN=$(echo "${MOUNTED[$i]}" | awk '{print $1}')
+    MP=$(echo "${MOUNTED[$i]}" | awk '{print $2}')
+    FREE=$(df -hP "$MP" 2>/dev/null | awk 'NR==2{print $4}')
+    echo "[$((i+1))] /dev/$DN mounted at $MP  free=$FREE"
+  done
+  read -rp "Select destination by number (or press Enter to type a path manually): " DSTSAVE_IDX || true
+  ARCH_DIR=""
+  if [[ "$DSTSAVE_IDX" =~ ^[0-9]+$ ]]; then
+    DSTSAVE_IDX=$((DSTSAVE_IDX-1))
+    if [ "$DSTSAVE_IDX" -lt 0 ] || [ "$DSTSAVE_IDX" -ge ${#MOUNTED[@]} ]; then echo "ERROR: selection out of range"; exit 1; fi
+    ARCH_DIR=$(echo "${MOUNTED[$DSTSAVE_IDX]}" | awk '{print $2}')
+  else
+    read -rp "Enter a directory path to save the archive (must exist): " ARCH_DIR
+  fi
+  [ -d "$ARCH_DIR" ] || { echo "Archive directory does not exist: $ARCH_DIR"; exit 1; }
+  # Ask for file name or a path within the chosen destination (absolute path also accepted)
+  read -rp "Enter archive file name or path [default ${SRC_BASENAME}.img.gz]: " ARCH_INPUT
+  ARCH_INPUT=${ARCH_INPUT:-${SRC_BASENAME}.img.gz}
+  # Determine full path: absolute provided → use as-is; otherwise place under chosen directory
+  if [[ "$ARCH_INPUT" = /* ]]; then
+    ARCH="$ARCH_INPUT"
+  else
+    # Treat leading ./ as relative to chosen destination directory
+    ARCH="$ARCH_DIR/${ARCH_INPUT#./}"
+  fi
+  
+  # If user provided a directory (ends with / or exists as a directory), use default filename inside it
+  if [[ "$ARCH_INPUT" == */ ]] || [ -d "$ARCH" ]; then
+    ARCH_DIRNAME="${ARCH%/}"
+    ARCH_BASE="${SRC_BASENAME}.img.gz"
+    ARCH="$ARCH_DIRNAME/$ARCH_BASE"
+  else
+    # Auto-append extension when missing on the basename
+    ARCH_DIRNAME=$(dirname "$ARCH")
+    ARCH_BASE=$(basename "$ARCH")
+    if [[ -n "$ARCH_BASE" ]]; then
+      if [[ "$ARCH_BASE" != *.gz ]]; then
+        if [[ "$ARCH_BASE" == *.img ]]; then
+          ARCH_BASE="${ARCH_BASE}.gz"
+        else
+          # If no dot in basename, append full .img.gz; otherwise leave as provided
+          if [[ "$ARCH_BASE" != *.* ]]; then
+            ARCH_BASE="${ARCH_BASE}.img.gz"
+          fi
+        fi
+      fi
+    fi
+    ARCH="$ARCH_DIRNAME/$ARCH_BASE"
+  fi
+  
+  # Ensure destination directory exists
+  mkdir -p "$ARCH_DIRNAME"
+  # Auto-append extension when missing on the basename
+  ARCH_DIRNAME=$(dirname "$ARCH")
+  ARCH_BASE=$(basename "$ARCH")
+  if [[ -n "$ARCH_BASE" ]]; then
+    if [[ "$ARCH_BASE" != *.gz ]]; then
+      if [[ "$ARCH_BASE" == *.img ]]; then
+        ARCH_BASE="${ARCH_BASE}.gz"
+      else
+        # If no dot in basename, append full .img.gz; otherwise leave as provided
+        if [[ "$ARCH_BASE" != *.* ]]; then
+          ARCH_BASE="${ARCH_BASE}.img.gz"
+        fi
+      fi
+    fi
+  fi
+  ARCH="$ARCH_DIRNAME/$ARCH_BASE"
+  if [ -e "$ARCH" ]; then read -rp "File exists at $ARCH. Overwrite? (y/N): " OW; [[ "$OW" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }; fi
 elif [[ "$OP" =~ ^[Rr]$ ]]; then
   # Restore from image to selected target disk
   read -rp "Enter archive image file to restore (e.g., ./sdb.img.gz): " ARCH
@@ -138,9 +216,6 @@ fi
 
 read -rp "Shrink all supported filesystems on SOURCE to minimum before operation? (y/N): " DO_SHRINK_ALL
 if [[ "$DO_SHRINK_ALL" =~ ^[Yy]$ ]]; then
-  if [ "$LIVE_ON_SOURCE" -eq 1 ]; then
-    echo "Skip shrink: SOURCE contains current root filesystem; cannot safely unmount."
-  else
   echo "=== Scanning partitions on $SRC for shrink ==="
   # List child partitions of the source disk only
   mapfile -t PARTS < <(lsblk -ln -o NAME,FSTYPE,MOUNTPOINT "$SRC" | awk 'NR>1 {print $1" "$2" "$3}')
@@ -149,6 +224,10 @@ if [[ "$DO_SHRINK_ALL" =~ ^[Yy]$ ]]; then
     FST=$(echo   "$line" | awk '{print $2}')
     MP=$(echo    "$line" | awk '{print $3}')
     DEV="/dev/$PNAME"
+    # If operating on live system disk, skip the live root partition
+    if [ "$LIVE_ON_SOURCE" -eq 1 ] && { [ "$DEV" = "$SYS_ROOT_SRC" ] || [ "$MP" = "/" ]; }; then
+      echo "--- skip live root: $DEV ---"; continue
+    fi
     case "$FST" in
       ext4)
         echo "--- ext4: $DEV ---"
@@ -176,7 +255,6 @@ if [[ "$DO_SHRINK_ALL" =~ ^[Yy]$ ]]; then
     esac
   done
   echo "Note: Partition boundaries are not changed in minimal script; only filesystems are minimized."
-  fi
 fi
 
 echo "=== Estimating space consumption on target/archive ==="
@@ -326,9 +404,6 @@ fi
 # Optional: restore SOURCE filesystems (ext4/ntfs) back to full partition size
 read -rp "Re-grow SOURCE filesystems (ext4/ntfs) to fill their partitions now? (y/N): " REGROW_SRC
 if [[ "$REGROW_SRC" =~ ^[Yy]$ ]]; then
-  if [ "$LIVE_ON_SOURCE" -eq 1 ]; then
-    echo "Skip re-grow: SOURCE contains current root filesystem; cannot safely unmount."
-  else
   echo "=== Re-growing filesystems on $SRC to full partition size ==="
   mapfile -t SPARTS < <(lsblk -ln -o NAME,FSTYPE,MOUNTPOINT "$SRC" | awk 'NR>1 {print $1" "$2" "$3}')
   for line in "${SPARTS[@]}"; do
@@ -336,6 +411,10 @@ if [[ "$REGROW_SRC" =~ ^[Yy]$ ]]; then
     FST=$(echo   "$line" | awk '{print $2}')
     MP=$(echo    "$line" | awk '{print $3}')
     DEV="/dev/$PNAME"
+    # If operating on live system disk, skip the live root partition
+    if [ "$LIVE_ON_SOURCE" -eq 1 ] && { [ "$DEV" = "$SYS_ROOT_SRC" ] || [ "$MP" = "/" ]; }; then
+      echo "--- skip live root: $DEV ---"; continue
+    fi
     case "$FST" in
       ext4)
         echo "--- ext4 grow: $DEV ---"
@@ -363,7 +442,6 @@ if [[ "$REGROW_SRC" =~ ^[Yy]$ ]]; then
     esac
   done
   echo "Done re-growing SOURCE filesystems."
-  fi
 fi
 
 echo "=== Done ==="
