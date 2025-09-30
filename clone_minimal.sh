@@ -1,15 +1,84 @@
 #!/bin/bash
 
-# Minimal disk cloner with optional ext4 shrink
+# Minimal disk cloner
 # - Lets user choose SOURCE and TARGET devices
-# - Optional: shrink SOURCE ext4 root partition to minimum (non-destructive)
 # - Clones disk → disk with dd + GPT backup fix (sgdisk -e)
 
 set -euo pipefail
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+
+# Self-test mode: validate environment and exit
+if [ "${1:-}" = "--self-test" ]; then
+  echo "=== Self-test ==="
+  echo "OS: $(. /etc/os-release 2>/dev/null || true; echo "${NAME:-unknown}")"
+  echo "User: $(id -un) (EUID=${EUID:-$(id -u)})"
+  echo "Checking commands..."
+  for cmd in dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      echo " - $cmd: OK"
+    else
+      echo " - $cmd: MISSING"
+    fi
+  done
+  echo "Listing disks:"
+  lsblk -dn -o NAME,TYPE,SIZE,MODEL || true
+  echo "=== Self-test done ==="
+  exit 0
+fi
+
+# --- Auto-install prerequisites (best effort) ---
+echo "=== Advanced Disk Cloner ==="
+echo "Checking prerequisites..."
+
+is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
+run_root() { if is_root; then "$@"; else sudo "$@"; fi }
+
+is_ubuntu() {
+  if [ -r /etc/os-release ]; then
+    . /etc/os-release
+    [ "${ID:-}" = "ubuntu" ] || case ",${ID_LIKE:-}," in *,ubuntu,*|*,debian,*) return 1 ;; esac
+    [ "${ID:-}" = "ubuntu" ] && return 0
+  fi
+  if command -v lsb_release >/dev/null 2>&1; then
+    [ "$(lsb_release -is 2>/dev/null || true)" = "Ubuntu" ] && return 0
+  fi
+  return 1
+}
+
+install_packages() {
+  if is_ubuntu; then
+    if [ "$#" -gt 0 ]; then echo "Installing packages via apt: $*"; fi
+    # Non-interactive, resilient apt
+    export DEBIAN_FRONTEND=noninteractive
+    run_root bash -c 'apt-get update -y || true; \
+      apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"' bash "$@" || true
+  else
+    echo "WARN: Auto-install is supported only on Ubuntu (apt). Skipping." >&2
+  fi
+}
+
+# Always attempt to install prerequisites on Ubuntu (non-fatal)
+if is_ubuntu; then
+  echo "Detected Ubuntu; ensuring required packages are installed..."
+  # core + optional tools used by features in this script
+  install_packages coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs
+else
+  echo "WARN: Non-Ubuntu system detected. Please install prerequisites manually: coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs" >&2
+fi
+
+# Ensure minimally required commands exist after best-effort install
 require dd
 require sfdisk
+require gzip
+require tar
+
+# Report archive capabilities
+HAS_PARTCLONE=no
+HAS_NTFSCLONE=no
+command -v partclone.extfs >/dev/null 2>&1 && HAS_PARTCLONE=yes || true
+command -v ntfsclone >/dev/null 2>&1 && HAS_NTFSCLONE=yes || true
+echo "Archive mode: used-block ext4=$HAS_PARTCLONE, ntfs=$HAS_NTFSCLONE (fallback to raw for others)"
 
 # Build numbered list of root disks: /dev/sd[a-z] and /dev/nvme*n1
 mapfile -t DISKS < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && ($1 ~ /^sd[a-z]+$/ || $1 ~ /^nvme[0-9]+n[0-9]+$/) {print $1}' | sort)
@@ -195,7 +264,6 @@ fi
 if [ "$LIVE_ON_SOURCE" -eq 1 ]; then
   echo "WARNING: You are operating on the current system disk (contains /)."
   echo "- Live cloning may produce an inconsistent image."
-  echo "- Shrink/Grow operations on SOURCE will be disabled to avoid unmounting /."
   read -rp "Proceed with READ-ONLY cloning/archiving anyway? (y/N): " PROCEED_LIVE
   [[ "$PROCEED_LIVE" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
 fi
@@ -214,48 +282,7 @@ if mount | awk -v d="$SRC" '$1 ~ d {found=1} END{exit !found}'; then
   [[ "$PROCLIVE" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
 fi
 
-read -rp "Shrink all supported filesystems on SOURCE to minimum before operation? (y/N): " DO_SHRINK_ALL
-if [[ "$DO_SHRINK_ALL" =~ ^[Yy]$ ]]; then
-  echo "=== Scanning partitions on $SRC for shrink ==="
-  # List child partitions of the source disk only
-  mapfile -t PARTS < <(lsblk -ln -o NAME,FSTYPE,MOUNTPOINT "$SRC" | awk 'NR>1 {print $1" "$2" "$3}')
-  for line in "${PARTS[@]}"; do
-    PNAME=$(echo "$line" | awk '{print $1}')
-    FST=$(echo   "$line" | awk '{print $2}')
-    MP=$(echo    "$line" | awk '{print $3}')
-    DEV="/dev/$PNAME"
-    # If operating on live system disk, skip the live root partition
-    if [ "$LIVE_ON_SOURCE" -eq 1 ] && { [ "$DEV" = "$SYS_ROOT_SRC" ] || [ "$MP" = "/" ]; }; then
-      echo "--- skip live root: $DEV ---"; continue
-    fi
-    case "$FST" in
-      ext4)
-        echo "--- ext4: $DEV ---"
-        [ -n "$MP" ] && { echo "Unmounting $DEV from $MP"; umount "$DEV" || true; }
-        if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
-          e2fsck -f "$DEV" || true
-          resize2fs -M "$DEV" || echo "WARN: resize2fs failed on $DEV"
-        else
-          echo "Missing e2fsck/resize2fs; skipping $DEV"
-        fi
-        ;;
-      ntfs)
-        echo "--- ntfs: $DEV ---"
-        [ -n "$MP" ] && { echo "Unmounting $DEV from $MP"; umount "$DEV" || true; }
-        if command -v ntfsresize >/dev/null 2>&1; then
-          # Shrink NTFS to its minimum; non-destructive filesystem-only shrink
-          ntfsresize -f -m "$DEV" || echo "WARN: ntfsresize failed on $DEV"
-        else
-          echo "Missing ntfsresize; skipping $DEV"
-        fi
-        ;;
-      *)
-        echo "--- skip: $DEV (fstype=$FST) ---"
-        ;;
-    esac
-  done
-  echo "Note: Partition boundaries are not changed in minimal script; only filesystems are minimized."
-fi
+## Shrinking feature removed
 
 echo "=== Estimating space consumption on target/archive ==="
 # Compute approximate data footprint to be present on target (sum of used/min fs sizes)
@@ -269,9 +296,10 @@ for line in "${PARTS2[@]}"; do
   case "$FST" in
     ext4)
       if command -v tune2fs >/dev/null 2>&1; then
-        BS=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block size:/ {gsub(/ /,""); print $2}')
-        BC=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block count:/ {gsub(/ /,""); print $2}')
-        FB=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Free blocks:/ {gsub(/ /,""); print $2}')
+        T2=$(tune2fs -l "$DEV" 2>/dev/null || true)
+        BS=$(printf '%s\n' "$T2" | awk -F: '/Block size:/ {gsub(/ /,""); print $2}')
+        BC=$(printf '%s\n' "$T2" | awk -F: '/Block count:/ {gsub(/ /,""); print $2}')
+        FB=$(printf '%s\n' "$T2" | awk -F: '/Free blocks:/ {gsub(/ /,""); print $2}')
         if [ -n "$BS" ] && [ -n "$BC" ] && [ -n "$FB" ]; then
           used=$(( (BC - FB) * BS ))
           estimate_bytes=$(( estimate_bytes + used ))
@@ -342,20 +370,162 @@ if [[ "$OP" =~ ^[Cc]$ ]]; then
   fi
   sync
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
-  # Archive: store partition table for later restore
-  sfdisk -d "$SRC" > "${ARCH%.gz}.sfdisk" 2>/dev/null || true
-  if command -v pv >/dev/null 2>&1; then
-    dd if="$SRC" bs=1M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | gzip -1 > "$ARCH"
+  # Archive: prefer used-block per-partition imaging into a tarball if tools available
+  if command -v partclone.extfs >/dev/null 2>&1 || command -v ntfsclone >/dev/null 2>&1; then
+    TMPDIR=$(mktemp -d)
+    cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
+    trap 'cleanup_tmp' EXIT INT TERM HUP
+    MANIFEST="$TMPDIR/manifest.tsv"
+    : > "$MANIFEST"
+    # Save partition table dump
+    sfdisk -d "$SRC" > "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
+    # Enumerate partitions on source disk
+    mapfile -t APARTS < <(lsblk -ln -o NAME,FSTYPE,SIZE,PARTLABEL,PARTUUID,PKNAME "$SRC" | awk 'NR>1 {print $1"\t"$2"\t"$3"\t"$4"\t"$5}')
+    for line in "${APARTS[@]}"; do
+      PNAME=$(echo -e "$line" | awk -F"\t" '{print $1}')
+      FST=$(echo -e   "$line" | awk -F"\t" '{print $2}')
+      DEV="/dev/$PNAME"
+      OUTBASE="$TMPDIR/part-${PNAME}"
+      case "$FST" in
+        ext4)
+          if command -v partclone.extfs >/dev/null 2>&1; then
+            echo -e "$PNAME\text4\tpartclone" >> "$MANIFEST"
+            if command -v pv >/dev/null 2>&1; then
+              partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
+            else
+              partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
+            fi
+          else
+            echo -e "$PNAME\text4\tdd" >> "$MANIFEST"
+            if command -v pv >/dev/null 2>&1; then
+              dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+            else
+              dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+            fi
+          fi
+          ;;
+        ntfs)
+          if command -v ntfsclone >/dev/null 2>&1; then
+            echo -e "$PNAME\tntfs\tntfsclone" >> "$MANIFEST"
+            if command -v pv >/dev/null 2>&1; then
+              ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+            else
+              ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
+            fi
+          else
+            echo -e "$PNAME\tntfs\tdd" >> "$MANIFEST"
+            if command -v pv >/dev/null 2>&1; then
+              dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+            else
+              dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+            fi
+          fi
+          ;;
+        *)
+          # Unknown FS: fallback to raw partition dump
+          echo -e "$PNAME\t$FST\tdd" >> "$MANIFEST"
+          if command -v pv >/dev/null 2>&1; then
+            dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+          else
+            dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+          fi
+          ;;
+      esac
+    done
+    # Package everything into a tarball (new-format archive)
+    ARCH_TAR="$ARCH"
+    case "$ARCH_TAR" in
+      *.gz|*.tgz) : ;;
+      *) ARCH_TAR="${ARCH_TAR}.tar.gz" ;;
+    esac
+    (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
+    mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
+    # Cleanup handled by trap
+    sync
   else
-    dd if="$SRC" bs=1M status=progress conv=noerror,sync | gzip -1 > "$ARCH"
+    # Legacy full-disk raw archive
+    sfdisk -d "$SRC" > "${ARCH%.gz}.sfdisk" 2>/dev/null || true
+    if command -v pv >/dev/null 2>&1; then
+      dd if="$SRC" bs=1M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | gzip -1 > "$ARCH"
+    else
+      dd if="$SRC" bs=1M status=progress conv=noerror,sync | gzip -1 > "$ARCH"
+    fi
+    sync
   fi
-  sync
 else
-  # Restore from archive image to target device
-  if command -v pv >/dev/null 2>&1; then
-    pv "$ARCH" | gzip -dc | dd of="$DST" bs=1M conv=fsync
+  # Restore from archive to target device
+  if tar -tzf "$ARCH" >/dev/null 2>&1; then
+    # New-format per-partition archive
+    TMPDIR=$(mktemp -d)
+    cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
+    trap 'cleanup_tmp' EXIT INT TERM HUP
+    tar -xzf "$ARCH" -C "$TMPDIR"
+    # Recreate partition table
+    if [ -f "$TMPDIR/partition_table.sfdisk" ]; then
+      sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
+      partprobe "$DST" || true
+      sync
+    fi
+    # Map target partitions list
+    mapfile -t TPARTS < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2=="" {next} $2!="" {print $1}')
+    # Restore per manifest order
+    if [ -f "$TMPDIR/manifest.tsv" ]; then
+      while IFS=$'\t' read -r PNAME FSTOOL TOOL; do
+        # Resolve target dev by partition number suffix in PNAME
+        # Extract numeric part index at end (e.g., sda3 -> 3, nvme0n1p2 -> 2)
+        IDX=$(echo "$PNAME" | grep -Eo '[0-9]+$' || true)
+        TDEV=""
+        if [ -n "$IDX" ]; then
+          # Find ${DST}${suffix} pattern
+          if [[ "$DST" =~ nvme[0-9]+n[0-9]+$ ]]; then
+            CAND="${DST}p${IDX}"
+          else
+            CAND="${DST}${IDX}"
+          fi
+          if [ -b "$CAND" ]; then TDEV="$CAND"; fi
+        fi
+        [ -n "$TDEV" ] || { echo "WARN: could not map partition $PNAME to target; skipping"; continue; }
+        BASE="$TMPDIR/part-${PNAME}"
+        case "$TOOL" in
+          partclone)
+            if [ -f "${BASE}.pc.gz" ] && command -v partclone.extfs >/dev/null 2>&1; then
+              gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+            else
+              echo "WARN: missing partclone image or tool for $PNAME"
+            fi
+            ;;
+          ntfsclone)
+            if [ -f "${BASE}.ntfs.gz" ] && command -v ntfsclone >/dev/null 2>&1; then
+              gzip -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
+            else
+              echo "WARN: missing ntfsclone image or tool for $PNAME"
+            fi
+            ;;
+          dd)
+            if [ -f "${BASE}.raw.gz" ]; then
+              if command -v pv >/dev/null 2>&1; then
+                gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+              else
+                gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+              fi
+            else
+              echo "WARN: missing raw image for $PNAME"
+            fi
+            ;;
+        esac
+        sync
+      done < "$TMPDIR/manifest.tsv"
+    else
+      echo "ERROR: manifest.tsv not found in archive"
+    fi
+    # Cleanup handled by trap
   else
-    gzip -dc "$ARCH" | dd of="$DST" bs=1M status=progress conv=fsync
+    # Legacy full-disk raw archive
+    if command -v pv >/dev/null 2>&1; then
+      pv "$ARCH" | gzip -dc | dd of="$DST" bs=1M conv=fsync
+    else
+      gzip -dc "$ARCH" | dd of="$DST" bs=1M status=progress conv=fsync
+    fi
   fi
   sync
 fi
@@ -401,48 +571,7 @@ else
   echo "Partition table dump: ${ARCH%.gz}.sfdisk (if available)"
 fi
 
-# Optional: restore SOURCE filesystems (ext4/ntfs) back to full partition size
-read -rp "Re-grow SOURCE filesystems (ext4/ntfs) to fill their partitions now? (y/N): " REGROW_SRC
-if [[ "$REGROW_SRC" =~ ^[Yy]$ ]]; then
-  echo "=== Re-growing filesystems on $SRC to full partition size ==="
-  mapfile -t SPARTS < <(lsblk -ln -o NAME,FSTYPE,MOUNTPOINT "$SRC" | awk 'NR>1 {print $1" "$2" "$3}')
-  for line in "${SPARTS[@]}"; do
-    PNAME=$(echo "$line" | awk '{print $1}')
-    FST=$(echo   "$line" | awk '{print $2}')
-    MP=$(echo    "$line" | awk '{print $3}')
-    DEV="/dev/$PNAME"
-    # If operating on live system disk, skip the live root partition
-    if [ "$LIVE_ON_SOURCE" -eq 1 ] && { [ "$DEV" = "$SYS_ROOT_SRC" ] || [ "$MP" = "/" ]; }; then
-      echo "--- skip live root: $DEV ---"; continue
-    fi
-    case "$FST" in
-      ext4)
-        echo "--- ext4 grow: $DEV ---"
-        [ -n "$MP" ] && { echo "Unmounting $DEV from $MP"; umount "$DEV" || true; }
-        if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
-          e2fsck -f "$DEV" || true
-          resize2fs "$DEV" || echo "WARN: resize2fs grow failed on $DEV"
-        else
-          echo "Missing e2fsck/resize2fs; skipping $DEV"
-        fi
-        ;;
-      ntfs)
-        echo "--- ntfs grow: $DEV ---"
-        [ -n "$MP" ] && { echo "Unmounting $DEV from $MP"; umount "$DEV" || true; }
-        if command -v ntfsresize >/dev/null 2>&1; then
-          # ntfsresize without size grows to maximum available in partition
-          ntfsresize -f "$DEV" || echo "WARN: ntfsresize grow failed on $DEV"
-        else
-          echo "Missing ntfsresize; skipping $DEV"
-        fi
-        ;;
-      *)
-        echo "--- skip: $DEV (fstype=$FST) ---"
-        ;;
-    esac
-  done
-  echo "Done re-growing SOURCE filesystems."
-fi
+## Source re-grow feature removed
 
 echo "=== Done ==="
 echo "Cloned $SRC to $DST. If the target is larger, you may later expand partitions/filesystems."
