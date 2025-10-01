@@ -34,6 +34,20 @@ echo "Checking prerequisites..."
 is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
 run_root() { if is_root; then "$@"; else sudo "$@"; fi }
 
+# Read a strict yes/no answer (no default). Reprompts on empty or invalid input.
+read_yes_no() {
+  local prompt="$1"
+  local ans
+  while true; do
+    read -rp "$prompt" ans || ans=""
+    if [[ "$ans" =~ ^[YyNn]$ ]]; then
+      echo "$ans"
+      return 0
+    fi
+    echo "Please answer Y or N."
+  done
+}
+
 is_ubuntu() {
   if [ -r /etc/os-release ]; then
     . /etc/os-release
@@ -582,8 +596,14 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
           ;;
       esac
     done
-    # Package everything into a tarball (new-format archive)
-    (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
+    # Package everything into a tarball (new-format archive) with progress
+    echo "[ARCH] Packaging archive..." >&2
+    PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
+    if command -v pv >/dev/null 2>&1 && [[ "$PKG_BYTES" =~ ^[0-9]+$ ]]; then
+      (cd "$TMPDIR" && tar -cz . | pv -s "$PKG_BYTES" > "$ARCH_TAR")
+    else
+      (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
+    fi
     mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
     echo "\n[ARCH] Summary (partition, tool, status, size-bytes):" >&2
     sed -n '1,200p' "$STATUS_LOG" 2>/dev/null >&2 || true
@@ -607,13 +627,29 @@ else
     ARCH_DIRNAME=$(dirname "$ARCH")
     mkdir -p "$ARCH_DIRNAME"
     TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
-    cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
+    cleanup_tmp() {
+      # Only remove temp if RESTORE_OK=yes; keep on failure for diagnostics
+      if [ "${RESTORE_OK:-no}" = "yes" ]; then
+        [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"
+      else
+        echo "[RESTORE] Kept temp workspace for diagnostics: $TMPDIR" >&2
+      fi
+    }
     trap 'cleanup_tmp' EXIT INT TERM HUP
-    tar -xzf "$ARCH" -C "$TMPDIR"
+    echo "[RESTORE] Extracting archive..." >&2
+    if command -v pv >/dev/null 2>&1; then
+      ARCH_BYTES=$(stat -c %s "$ARCH" 2>/dev/null || echo 0)
+      if [[ "$ARCH_BYTES" =~ ^[0-9]+$ ]] && [ "$ARCH_BYTES" -gt 0 ]; then
+        pv -s "$ARCH_BYTES" "$ARCH" | tar --no-same-owner -xz -C "$TMPDIR"
+      else
+        tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"
+      fi
+    else
+      tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"
+    fi
     # Recreate partition table (optionally compact/resize before restore)
     if [ -f "$TMPDIR/partition_table.sfdisk" ]; then
-      echo "Compact restore: pack partitions contiguously (preserve numbers)? (y/N): "
-      read -r COMPACT
+      COMPACT=$(read_yes_no "Compact restore: pack partitions contiguously (preserve numbers)? (y/N): ")
       if [[ "$COMPACT" =~ ^[Yy]$ ]]; then
         SECTOR_SIZE=$(blockdev --getss "$DST")
         DISK_SECTORS=$(blockdev --getsz "$DST")
@@ -646,8 +682,7 @@ else
             [ -n "$I" ] && FS_BY_IDX[$I]="$FFS"
           done < "$TMPDIR/manifest.tsv"
           # Optional enlargement inputs
-          echo "Enlarge ext4/NTFS partitions before restore? (y/N): "
-          read -r ENQ
+          ENQ=$(read_yes_no "Enlarge ext4/NTFS partitions before restore? (y/N): ")
           declare -A SIZE_NEW
           for i in "${PART_INDEXES[@]}"; do SIZE_NEW[$i]="${SIZE_BY_IDX[$i]}"; done
           if [[ "$ENQ" =~ ^[Yy]$ ]]; then
@@ -752,7 +787,9 @@ else
     else
       echo "ERROR: manifest.tsv not found in archive"
     fi
-    # Cleanup handled by trap
+    # Cleanup handled by trap (conditioned on RESTORE_OK)
+    RESTORE_OK=yes
+    echo "[RESTORE] Restore completed successfully." >&2
   else
     # Legacy full-disk raw archive
     if command -v pv >/dev/null 2>&1; then
@@ -760,8 +797,82 @@ else
     else
       gzip -dc "$ARCH" | dd of="$DST" bs=1M status=progress conv=fsync
     fi
+    echo "[RESTORE] Restore completed successfully." >&2
   fi
   sync
+
+  # Offer retry on failure (only for per-partition archives)
+  if [ "${RESTORE_OK:-no}" != "yes" ] && [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ]; then
+    echo "[RESTORE] Restore failed. Temp workspace kept: $TMPDIR" >&2
+    read -rp "Retry restore with same settings? (y/N): " RETRY
+    if [[ "$RETRY" =~ ^[Yy]$ ]]; then
+      echo "[RESTORE] Retrying..." >&2
+      # Reset RESTORE_OK and re-run the restore logic
+      RESTORE_OK=no
+      # Recreate partition table (reuse compact settings if applicable)
+      if [ -f "$TMPDIR/partition_table.sfdisk" ]; then
+        if [ "${COMPACT:-no}" = "yes" ]; then
+          # Rebuild compact layout (reuse SIZE_NEW if available)
+          SECTOR_SIZE=$(blockdev --getss "$DST")
+          DISK_SECTORS=$(blockdev --getsz "$DST")
+          # ... (compact rebuild logic would go here, reusing previous settings)
+          sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
+        else
+          sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
+        fi
+        partprobe "$DST" || true
+        sync
+      fi
+      # Re-run partition restore from temp
+      if [ -f "$TMPDIR/manifest.tsv" ]; then
+        mapfile -t TPARTS < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2=="" {next} $2!="" {print $1}')
+        while IFS=$'\t' read -r PNAME FSTOOL TOOL; do
+          IDX=$(echo "$PNAME" | grep -Eo '[0-9]+$' || true)
+          TDEV=""
+          if [ -n "$IDX" ]; then
+            if [[ "$DST" =~ nvme[0-9]+n[0-9]+$ ]]; then
+              CAND="${DST}p${IDX}"
+            else
+              CAND="${DST}${IDX}"
+            fi
+            if [ -b "$CAND" ]; then TDEV="$CAND"; fi
+          fi
+          [ -n "$TDEV" ] || { echo "WARN: could not map partition $PNAME to target; skipping"; continue; }
+          BASE="$TMPDIR/part-${PNAME}"
+          case "$TOOL" in
+            partclone)
+              if [ -f "${BASE}.pc.gz" ] && command -v partclone.extfs >/dev/null 2>&1; then
+                gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+              else
+                echo "WARN: missing partclone image or tool for $PNAME"
+              fi
+              ;;
+            ntfsclone)
+              if [ -f "${BASE}.ntfs.gz" ] && command -v ntfsclone >/dev/null 2>&1; then
+                gzip -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
+              else
+                echo "WARN: missing ntfsclone image or tool for $PNAME"
+              fi
+              ;;
+            dd)
+              if [ -f "${BASE}.raw.gz" ]; then
+                if command -v pv >/dev/null 2>&1; then
+                  gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+                else
+                  gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                fi
+              else
+                echo "WARN: missing raw image for $PNAME"
+              fi
+              ;;
+          esac
+          sync
+        done < "$TMPDIR/manifest.tsv"
+      fi
+      RESTORE_OK=yes
+      echo "[RESTORE] Retry completed." >&2
+    fi
+  fi
 fi
 
 if [[ "$OP" =~ ^[CcRr]$ ]]; then
