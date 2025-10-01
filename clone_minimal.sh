@@ -49,23 +49,75 @@ is_ubuntu() {
 install_packages() {
   if is_ubuntu; then
     if [ "$#" -gt 0 ]; then echo "Installing packages via apt: $*"; fi
-    # Non-interactive, resilient apt
     export DEBIAN_FRONTEND=noninteractive
-    run_root bash -c 'apt-get update -y || true; \
-      apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"' bash "$@" || true
+    run_root bash -lc 'apt-get update -y || true; apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"' _ "$@" || true
   else
     echo "WARN: Auto-install is supported only on Ubuntu (apt). Skipping." >&2
   fi
 }
 
+# Ensure a set of commands exist; on Ubuntu, attempt to install their packages.
+ensure_commands() {
+  missing_cmds=()
+  for c in "$@"; do
+    if ! command -v "$c" >/dev/null 2>&1; then
+      missing_cmds+=("$c")
+    fi
+  done
+  if [ ${#missing_cmds[@]} -eq 0 ]; then
+    return 0
+  fi
+  if is_ubuntu; then
+    # Map commands → packages (Ubuntu)
+    declare -A PKG_FOR_CMD
+    PKG_FOR_CMD[dd]="coreutils"
+    PKG_FOR_CMD[sfdisk]="util-linux"
+    PKG_FOR_CMD[lsblk]="util-linux"
+    PKG_FOR_CMD[gzip]="gzip"
+    PKG_FOR_CMD[tar]="tar"
+    PKG_FOR_CMD[pv]="pv"
+    PKG_FOR_CMD[gdisk]="gdisk"
+    PKG_FOR_CMD[sgdisk]="gdisk"
+    PKG_FOR_CMD[partclone.extfs]="partclone"
+    PKG_FOR_CMD[ntfsclone]="ntfs-3g"
+    PKG_FOR_CMD[tune2fs]="e2fsprogs"
+    PKG_FOR_CMD[e2fsck]="e2fsprogs"
+    PKG_FOR_CMD[resize2fs]="e2fsprogs"
+
+    # Build unique package list
+    pkgs=()
+    for c in "${missing_cmds[@]}"; do
+      p="${PKG_FOR_CMD[$c]:-}"
+      if [ -n "$p" ]; then
+        case " ${pkgs[*]} " in *" $p "*) :;; *) pkgs+=("$p");; esac
+      fi
+    done
+    if [ ${#pkgs[@]} -gt 0 ]; then
+      install_packages "${pkgs[@]}"
+    fi
+    # Re-check after installation
+    post_missing=()
+    for c in "$@"; do
+      if ! command -v "$c" >/dev/null 2>&1; then
+        post_missing+=("$c")
+      fi
+    done
+    if [ ${#post_missing[@]} -gt 0 ]; then
+      echo "ERROR: Missing required commands after install attempt: ${post_missing[*]}" >&2
+      echo "Please install the packages manually and re-run." >&2
+      exit 1
+    fi
+  else
+    echo "ERROR: Missing required commands on non-Ubuntu system: ${missing_cmds[*]}" >&2
+    echo "Please install: coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs" >&2
+    exit 1
+  fi
+}
+
 # Always attempt to install prerequisites on Ubuntu (non-fatal)
-if is_ubuntu; then
-  echo "Detected Ubuntu; ensuring required packages are installed..."
-  # core + optional tools used by features in this script
-  install_packages coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs
-else
-  echo "WARN: Non-Ubuntu system detected. Please install prerequisites manually: coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs" >&2
-fi
+echo "Ensuring required commands are available..."
+# Core + feature commands needed by this script
+ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs
 
 # Ensure minimally required commands exist after best-effort install
 require dd
@@ -372,11 +424,22 @@ if [[ "$OP" =~ ^[Cc]$ ]]; then
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
   # Archive: prefer used-block per-partition imaging into a tarball if tools available
   if command -v partclone.extfs >/dev/null 2>&1 || command -v ntfsclone >/dev/null 2>&1; then
-    TMPDIR=$(mktemp -d)
+    # Create a temporary workspace on the destination filesystem (not /tmp),
+    # to avoid running out of space when root has low free space.
+    ARCH_TAR="$ARCH"
+    case "$ARCH_TAR" in
+      *.gz|*.tgz) : ;;
+      *) ARCH_TAR="${ARCH_TAR}.tar.gz" ;;
+    esac
+    ARCH_DIRNAME=$(dirname "$ARCH_TAR")
+    mkdir -p "$ARCH_DIRNAME"
+    TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
     cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
     trap 'cleanup_tmp' EXIT INT TERM HUP
     MANIFEST="$TMPDIR/manifest.tsv"
+    STATUS_LOG="$TMPDIR/status.tsv"
     : > "$MANIFEST"
+    : > "$STATUS_LOG"
     # Save partition table dump
     sfdisk -d "$SRC" > "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
     # Enumerate partitions on source disk
@@ -386,60 +449,115 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       FST=$(echo -e   "$line" | awk -F"\t" '{print $2}')
       DEV="/dev/$PNAME"
       OUTBASE="$TMPDIR/part-${PNAME}"
+      echo "[ARCH] Start: $PNAME (fs=${FST:-unknown})" >&2
       case "$FST" in
         ext4)
-          if command -v partclone.extfs >/dev/null 2>&1; then
+          # If partition is mounted (e.g., root), avoid partclone and fallback to dd
+          MOUNTED_AT=$(findmnt -no TARGET "$DEV" 2>/dev/null || true)
+          if command -v partclone.extfs >/dev/null 2>&1 && [ -z "$MOUNTED_AT" ]; then
             echo -e "$PNAME\text4\tpartclone" >> "$MANIFEST"
-            if command -v pv >/dev/null 2>&1; then
-              partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
+            (
+              set +e -o pipefail
+              if command -v pv >/dev/null 2>&1; then
+                partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
+              else
+                partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
+              fi
+            ); rc=$?
+            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.pc.gz" ]; then
+              sz=$(stat -c %s "${OUTBASE}.pc.gz" 2>/dev/null || echo 0)
+              echo -e "$PNAME\tpartclone\tOK\t$sz" >> "$STATUS_LOG"
+              echo "[ARCH] Done: $PNAME via partclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
             else
-              partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
+              echo -e "$PNAME\tpartclone\tFAIL\t0" >> "$STATUS_LOG"
+              echo "[ARCH] FAIL: $PNAME via partclone (rc=$rc)" >&2
             fi
           else
             echo -e "$PNAME\text4\tdd" >> "$MANIFEST"
-            if command -v pv >/dev/null 2>&1; then
-              dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+            (
+              set +e -o pipefail
+              if command -v pv >/dev/null 2>&1; then
+                dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+              else
+                dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+              fi
+            ); rc=$?
+            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
+              sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
+              echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
+              echo "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
             else
-              dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+              echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
+              echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
             fi
           fi
           ;;
         ntfs)
           if command -v ntfsclone >/dev/null 2>&1; then
             echo -e "$PNAME\tntfs\tntfsclone" >> "$MANIFEST"
-            if command -v pv >/dev/null 2>&1; then
-              ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+            (
+              set +e -o pipefail
+              if command -v pv >/dev/null 2>&1; then
+                ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+              else
+                ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
+              fi
+            ); rc=$?
+            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.ntfs.gz" ]; then
+              sz=$(stat -c %s "${OUTBASE}.ntfs.gz" 2>/dev/null || echo 0)
+              echo -e "$PNAME\tntfsclone\tOK\t$sz" >> "$STATUS_LOG"
+              echo "[ARCH] Done: $PNAME via ntfsclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
             else
-              ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
+              echo -e "$PNAME\tntfsclone\tFAIL\t0" >> "$STATUS_LOG"
+              echo "[ARCH] FAIL: $PNAME via ntfsclone (rc=$rc)" >&2
             fi
           else
             echo -e "$PNAME\tntfs\tdd" >> "$MANIFEST"
-            if command -v pv >/dev/null 2>&1; then
-              dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+            (
+              set +e -o pipefail
+              if command -v pv >/dev/null 2>&1; then
+                dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+              else
+                dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+              fi
+            ); rc=$?
+            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
+              sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
+              echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
+              echo "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
             else
-              dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+              echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
+              echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
             fi
           fi
           ;;
         *)
           # Unknown FS: fallback to raw partition dump
           echo -e "$PNAME\t$FST\tdd" >> "$MANIFEST"
-          if command -v pv >/dev/null 2>&1; then
-            dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+          (
+            set +e -o pipefail
+            if command -v pv >/dev/null 2>&1; then
+              dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+            else
+              dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+            fi
+          ); rc=$?
+          if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
+            sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
+            echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
+            echo "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
           else
-            dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+            echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
+            echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
           fi
           ;;
       esac
     done
     # Package everything into a tarball (new-format archive)
-    ARCH_TAR="$ARCH"
-    case "$ARCH_TAR" in
-      *.gz|*.tgz) : ;;
-      *) ARCH_TAR="${ARCH_TAR}.tar.gz" ;;
-    esac
     (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
     mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
+    echo "\n[ARCH] Summary (partition, tool, status, size-bytes):" >&2
+    sed -n '1,200p' "$STATUS_LOG" 2>/dev/null >&2 || true
     # Cleanup handled by trap
     sync
   else
@@ -460,9 +578,93 @@ else
     cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
     trap 'cleanup_tmp' EXIT INT TERM HUP
     tar -xzf "$ARCH" -C "$TMPDIR"
-    # Recreate partition table
+    # Recreate partition table (optionally compact/resize before restore)
     if [ -f "$TMPDIR/partition_table.sfdisk" ]; then
-      sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
+      echo "Compact restore: pack partitions contiguously (preserve numbers)? (y/N): "
+      read -r COMPACT
+      if [[ "$COMPACT" =~ ^[Yy]$ ]]; then
+        SECTOR_SIZE=$(blockdev --getss "$DST")
+        DISK_SECTORS=$(blockdev --getsz "$DST")
+        # Parse original dump to collect partition sizes and types by index
+        # Lines look like: /dev/nvme0n1p3 : start=     123, size=   456, type=...
+        mapfile -t DUMP_LINES < <(grep -E "^$DST(p|)[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
+        if [ ${#DUMP_LINES[@]} -eq 0 ]; then
+          echo "WARN: Could not parse original partition table; falling back to original layout."
+          sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
+        else
+          # Build arrays: IDX -> TYPE, SIZE_SECT
+          PART_INDEXES=()
+          declare -A TYPE_BY_IDX
+          declare -A SIZE_BY_IDX
+          for ln in "${DUMP_LINES[@]}"; do
+            idx=$(printf '%s' "$ln" | grep -Eo '[0-9]+(?=\s*:)' | tail -n1)
+            type=$(printf '%s' "$ln" | awk -F'type=' 'NF>1{print $2}' | awk -F',' '{print $1}' | sed 's/[[:space:]]//g')
+            size=$(printf '%s' "$ln" | awk -F'size=' 'NF>1{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+            if [[ "$idx" =~ ^[0-9]+$ ]] && [[ "$size" =~ ^[0-9]+$ ]]; then
+              PART_INDEXES+=("$idx")
+              TYPE_BY_IDX[$idx]="$type"
+              SIZE_BY_IDX[$idx]="$size"
+            fi
+          done
+          # Discover filesystems to allow enlargement prompts (ext4/ntfs only)
+          declare -A FS_BY_IDX
+          while IFS=$'\t' read -r PNAME FFS TOOL; do
+            # extract numeric index from PNAME
+            I=$(echo "$PNAME" | grep -Eo '[0-9]+$' || true)
+            [ -n "$I" ] && FS_BY_IDX[$I]="$FFS"
+          done < "$TMPDIR/manifest.tsv"
+          # Optional enlargement inputs
+          echo "Enlarge ext4/NTFS partitions before restore? (y/N): "
+          read -r ENQ
+          declare -A SIZE_NEW
+          for i in "${PART_INDEXES[@]}"; do SIZE_NEW[$i]="${SIZE_BY_IDX[$i]}"; done
+          if [[ "$ENQ" =~ ^[Yy]$ ]]; then
+            # Compute free sectors budget = DISK_SECTORS - sum(original sizes) (starts auto/contiguous)
+            sum=0
+            for i in "${PART_INDEXES[@]}"; do sum=$((sum + SIZE_BY_IDX[$i])); done
+            FREE=$((DISK_SECTORS - sum))
+            for i in "${PART_INDEXES[@]}"; do
+              fs="${FS_BY_IDX[$i]:-}"
+              if [ "$fs" = "ext4" ] || [ "$fs" = "ntfs" ]; then
+                cur="${SIZE_NEW[$i]}"
+                cur_h=$(numfmt --to=iec $((cur*SECTOR_SIZE)) 2>/dev/null || echo "$cur sectors")
+                free_h=$(numfmt --to=iec $((FREE*SECTOR_SIZE)) 2>/dev/null || echo "$FREE sectors")
+                echo "Partition $i (fs=$fs): current ${cur_h}. Add extra size (e.g. +10G) or Enter to skip [free ${free_h}]: "
+                read -r EXTRA
+                if [[ "$EXTRA" =~ ^\+?[0-9]+[KkMmGgTt]$ ]]; then
+                  bytes=$(numfmt --from=iec "${EXTRA#+}" 2>/dev/null || echo 0)
+                  add_sect=$(( bytes / SECTOR_SIZE ))
+                  if [ "$add_sect" -le 0 ] || [ "$add_sect" -gt "$FREE" ]; then
+                    echo "WARN: extra size out of range; skipping."
+                  else
+                    SIZE_NEW[$i]=$((cur + add_sect))
+                    FREE=$((FREE - add_sect))
+                  fi
+                fi
+              fi
+            done
+          fi
+          # Build compact sfdisk script with contiguous partitions, keeping numbers and types
+          NEWTAB=$(mktemp)
+          {
+            echo "label: gpt"
+            echo "unit: sectors"
+            for i in "${PART_INDEXES[@]}"; do
+              t="${TYPE_BY_IDX[$i]}"; s="${SIZE_NEW[$i]}"
+              # sfdisk line: <dev>p<i> : size=<s>, type=<t>
+              if [[ "$DST" =~ nvme[0-9]+n[0-9]+$ ]]; then
+                echo "${DST}p${i} : size=${s}${t:+, type=$t}"
+              else
+                echo "${DST}${i} : size=${s}${t:+, type=$t}"
+              fi
+            done
+          } > "$NEWTAB"
+          sfdisk "$DST" < "$NEWTAB"
+          rm -f "$NEWTAB"
+        fi
+      else
+        sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
+      fi
       partprobe "$DST" || true
       sync
     fi
@@ -544,6 +746,66 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
   lsblk "$SRC"
   echo "\n=== Target layout ==="
   lsblk "$DST"
+
+  # Offer to enlarge the last growable partition on restore to use remaining free space
+  if [[ "$OP" =~ ^[Rr]$ ]]; then
+    # Identify last partition device on target
+    LAST_PART_NAME=$(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2!="" {print $1}' | tail -n1)
+    if [ -n "$LAST_PART_NAME" ]; then
+      LAST_PART="/dev/${LAST_PART_NAME}"
+      FSTYPE_LAST=$(lsblk -no FSTYPE "$LAST_PART" 2>/dev/null || true)
+      # Only attempt if filesystem appears growable
+      if [ "$FSTYPE_LAST" = "ext4" ] || [ "$FSTYPE_LAST" = "ntfs" ]; then
+        # Compute current and possible max sizes
+        SECTOR_SIZE=$(blockdev --getss "$DST")
+        DISK_SECTORS=$(blockdev --getsz "$DST")
+        CUR_BYTES=$(blockdev --getsize64 "$LAST_PART")
+        # Parse start sector of last partition from sfdisk -d
+        # Match by partition device name suffix in the dump
+        START_SECT=$(sfdisk -d "$DST" 2>/dev/null | awk -v p="${LAST_PART}" '$1==p {for(i=1;i<=NF;i++){if($i ~ /^start=/){gsub(/start=/,"",$i); gsub(/,/,"",$i); print $i; exit}}}')
+        if [[ "$START_SECT" =~ ^[0-9]+$ ]] && [[ "$SECTOR_SIZE" =~ ^[0-9]+$ ]] && [[ "$DISK_SECTORS" =~ ^[0-9]+$ ]]; then
+          MAX_BYTES=$(( (DISK_SECTORS - START_SECT) * SECTOR_SIZE ))
+          if [ "$MAX_BYTES" -gt "$CUR_BYTES" ]; then
+            CUR_H=$(numfmt --to=iec "$CUR_BYTES" 2>/dev/null || echo "$CUR_BYTES bytes")
+            MAX_H=$(numfmt --to=iec "$MAX_BYTES" 2>/dev/null || echo "$MAX_BYTES bytes")
+            echo "\nLast partition: $LAST_PART (fs=$FSTYPE_LAST)"
+            echo "Current size:  $CUR_H"
+            echo "Possible max:  $MAX_H (using remaining free space)"
+            read -rp "Enlarge this partition now to use free space? (y/N): " ENL
+            if [[ "$ENL" =~ ^[Yy]$ ]]; then
+              # Determine partition index number for sfdisk -N
+              PNUM=$(echo "$LAST_PART_NAME" | grep -Eo '[0-9]+$' || true)
+              if [[ "$PNUM" =~ ^[0-9]+$ ]]; then
+                # Unmount if mounted
+                mount | awk -v p="$LAST_PART" '$1 == p {print $3}' | xargs -r -n1 umount || true
+                echo ",+" | sfdisk --no-reread -N "$PNUM" "$DST" || true
+                partprobe "$DST" || true
+                sync
+                if [ "$FSTYPE_LAST" = "ext4" ]; then
+                  if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
+                    e2fsck -f "$LAST_PART" || true
+                    resize2fs "$LAST_PART" || true
+                    echo "Ext4 filesystem grown."
+                  else
+                    echo "e2fsck/resize2fs not available; skipped filesystem grow."
+                  fi
+                elif [ "$FSTYPE_LAST" = "ntfs" ]; then
+                  if command -v ntfsresize >/dev/null 2>&1; then
+                    ntfsresize -f "$LAST_PART" || true
+                    echo "NTFS filesystem grown."
+                  else
+                    echo "ntfsresize not available; skipped filesystem grow."
+                  fi
+                fi
+              else
+                echo "WARN: Could not determine partition index for $LAST_PART; skipping enlarge."
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
 
   # Optional: fix low space on Linux root by growing ext4 to full partition and lowering reserved blocks
   read -rp "Grow ext4 filesystem on TARGET to fill its partition and set reserved to 1%? (y/N): " GROW
