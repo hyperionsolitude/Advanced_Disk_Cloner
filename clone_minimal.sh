@@ -298,7 +298,26 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
 elif [[ "$OP" =~ ^[Rr]$ ]]; then
   # Restore from image to selected target disk
   read -rp "Enter archive image file to restore (e.g., ./sdb.img.gz): " ARCH
-  [ -f "$ARCH" ] || { echo "Archive not found: $ARCH"; exit 1; }
+  if [ ! -f "$ARCH" ]; then
+    # If a relative path was provided, try resolving against mounted real-disk destinations
+    # Collect mounted destinations where TYPE=part, parent PKNAME is sdX or nvme*n1
+    mapfile -t MOUNTED_MP < <(lsblk -ln -o NAME,TYPE,MOUNTPOINT,PKNAME | \
+      awk '$2=="part" && $3!="" && ($4 ~ /^sd[a-z]+$/ || $4 ~ /^nvme[0-9]+n[0-9]+$/) {print $3}' | sort -u)
+    RESOLVED=""
+    for mp in "${MOUNTED_MP[@]}"; do
+      # Try as provided relative under mountpoint
+      if [ -f "$mp/$ARCH" ]; then RESOLVED="$mp/$ARCH"; break; fi
+      # Try just the basename under mountpoint
+      base=$(basename -- "$ARCH")
+      if [ -n "$base" ] && [ -f "$mp/$base" ]; then RESOLVED="$mp/$base"; break; fi
+    done
+    if [ -n "$RESOLVED" ]; then
+      echo "Resolved archive path: $RESOLVED"
+      ARCH="$RESOLVED"
+    else
+      echo "Archive not found: $ARCH"; echo "Checked mountpoints: ${MOUNTED_MP[*]:-none}"; exit 1
+    fi
+  fi
   echo "=== Available Disks (restore target) ==="
   for i in "${!DISKS[@]}"; do
     NAME="${DISKS[$i]}"; SIZE=$(lsblk -dn -o SIZE "/dev/$NAME"); MODEL=$(lsblk -dn -o MODEL "/dev/$NAME" | sed 's/^ *$/(unknown)/')
@@ -361,8 +380,9 @@ for line in "${PARTS2[@]}"; do
       ;;
     ntfs)
       if command -v ntfsresize >/dev/null 2>&1; then
-        # Parse minimal size from ntfsresize -i output (in bytes)
-        minb=$(ntfsresize -i -f "$DEV" 2>&1 | awk '/minim/ {for(i=1;i<=NF;i++) if($i ~ /bytes/) {print $(i-1); exit}}')
+        # Run ntfsresize info safely; ignore non-zero exit and parse output
+        _ntfs_info=$(ntfsresize -i -f "$DEV" 2>&1 || true)
+        minb=$(printf '%s\n' "$_ntfs_info" | awk '/minim/ {for(i=1;i<=NF;i++) if($i ~ /bytes/) {print $(i-1); exit}}')
         if [[ "$minb" =~ ^[0-9]+$ ]]; then
           estimate_bytes=$(( estimate_bytes + minb ))
           continue
@@ -388,10 +408,19 @@ else
   DST_BYTES=0
 fi
 
-echo "Approx. data footprint to be present on target: $(numfmt --to=iec "$estimate_bytes" 2>/dev/null || echo $estimate_bytes bytes)"
-echo "Source disk size (raw device):                 $(numfmt --to=iec "$SRC_BYTES" 2>/dev/null || echo $SRC_BYTES bytes)"
+if command -v numfmt >/dev/null 2>&1; then
+  echo "Approx. data footprint to be present on target: $(numfmt --to=iec "$estimate_bytes")"
+  echo "Source disk size (raw device):                 $(numfmt --to=iec "$SRC_BYTES")"
+else
+  echo "Approx. data footprint to be present on target: ${estimate_bytes} bytes"
+  echo "Source disk size (raw device):                 ${SRC_BYTES} bytes"
+fi
 if [[ "$OP" =~ ^[Cc]$ ]]; then
-  echo "Target disk size:                               $(numfmt --to=iec "$DST_BYTES" 2>/dev/null || echo $DST_BYTES bytes)"
+  if command -v numfmt >/dev/null 2>&1; then
+    echo "Target disk size:                               $(numfmt --to=iec "$DST_BYTES")"
+  else
+    echo "Target disk size:                               ${DST_BYTES} bytes"
+  fi
   if [ "$SRC_BYTES" -gt "$DST_BYTES" ]; then
     echo "ERROR: Target is smaller than source; cannot proceed."
     exit 1
@@ -574,7 +603,10 @@ else
   # Restore from archive to target device
   if tar -tzf "$ARCH" >/dev/null 2>&1; then
     # New-format per-partition archive
-    TMPDIR=$(mktemp -d)
+    # Create temporary workspace on the same filesystem as the archive (not /tmp)
+    ARCH_DIRNAME=$(dirname "$ARCH")
+    mkdir -p "$ARCH_DIRNAME"
+    TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
     cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
     trap 'cleanup_tmp' EXIT INT TERM HUP
     tar -xzf "$ARCH" -C "$TMPDIR"
