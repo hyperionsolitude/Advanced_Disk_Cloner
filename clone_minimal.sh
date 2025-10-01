@@ -292,22 +292,6 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   
   # Ensure destination directory exists
   mkdir -p "$ARCH_DIRNAME"
-  # Auto-append extension when missing on the basename
-  ARCH_DIRNAME=$(dirname "$ARCH")
-  ARCH_BASE=$(basename "$ARCH")
-  if [[ -n "$ARCH_BASE" ]]; then
-    if [[ "$ARCH_BASE" != *.gz ]]; then
-      if [[ "$ARCH_BASE" == *.img ]]; then
-        ARCH_BASE="${ARCH_BASE}.gz"
-      else
-        # If no dot in basename, append full .img.gz; otherwise leave as provided
-        if [[ "$ARCH_BASE" != *.* ]]; then
-          ARCH_BASE="${ARCH_BASE}.img.gz"
-        fi
-      fi
-    fi
-  fi
-  ARCH="$ARCH_DIRNAME/$ARCH_BASE"
   if [ -e "$ARCH" ]; then read -rp "File exists at $ARCH. Overwrite? (y/N): " OW; [[ "$OW" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }; fi
 elif [[ "$OP" =~ ^[Rr]$ ]]; then
   # Restore from image to selected target disk
@@ -414,10 +398,16 @@ for line in "${PARTS2[@]}"; do
   fi
 done
 
-# Get device sizes
-SRC_BYTES=$(blockdev --getsize64 "$SRC")
+# Get device sizes with error checking
+SRC_BYTES=$(blockdev --getsize64 "$SRC" 2>/dev/null || echo "0")
+if [[ ! "$SRC_BYTES" =~ ^[0-9]+$ ]] || [ "$SRC_BYTES" -eq 0 ]; then
+  echo "ERROR: Could not determine source device size: $SRC"; exit 1
+fi
 if [[ "$OP" =~ ^[Cc]$ ]]; then
-  DST_BYTES=$(blockdev --getsize64 "$DST")
+  DST_BYTES=$(blockdev --getsize64 "$DST" 2>/dev/null || echo "0")
+  if [[ ! "$DST_BYTES" =~ ^[0-9]+$ ]] || [ "$DST_BYTES" -eq 0 ]; then
+    echo "ERROR: Could not determine target device size: $DST"; exit 1
+  fi
 else
   DST_BYTES=0
 fi
@@ -445,7 +435,7 @@ else
   echo "Restore image:                                  $ARCH"
 fi
 
-read -rp "Proceed with operation given the estimates above? (y/N): " PROCEED_EST
+PROCEED_EST=$(read_yes_no "Proceed with operation given the estimates above? (y/N): ")
 [[ "$PROCEED_EST" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
 
 if [[ "$OP" =~ ^[Cc]$ ]]; then
@@ -701,19 +691,23 @@ else
                 read -r EXTRA
                 if [[ "$EXTRA" =~ ^\+?[0-9]+[KkMmGgTt]$ ]]; then
                   bytes=$(numfmt --from=iec "${EXTRA#+}" 2>/dev/null || echo 0)
-                  add_sect=$(( bytes / SECTOR_SIZE ))
-                  if [ "$add_sect" -le 0 ] || [ "$add_sect" -gt "$FREE" ]; then
-                    echo "WARN: extra size out of range; skipping."
+                  if [ "$SECTOR_SIZE" -gt 0 ]; then
+                    add_sect=$(( bytes / SECTOR_SIZE ))
+                    if [ "$add_sect" -le 0 ] || [ "$add_sect" -gt "$FREE" ]; then
+                      echo "WARN: extra size out of range; skipping."
+                    else
+                      SIZE_NEW[$i]=$((cur + add_sect))
+                      FREE=$((FREE - add_sect))
+                    fi
                   else
-                    SIZE_NEW[$i]=$((cur + add_sect))
-                    FREE=$((FREE - add_sect))
+                    echo "WARN: invalid sector size; skipping."
                   fi
                 fi
               fi
             done
           fi
           # Build compact sfdisk script with contiguous partitions, keeping numbers and types
-          NEWTAB=$(mktemp)
+          NEWTAB=$(mktemp --tmpdir="${ARCH_DIRNAME}")
           {
             echo "label: gpt"
             echo "unit: sectors"
@@ -915,7 +909,7 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
             echo "\nLast partition: $LAST_PART (fs=$FSTYPE_LAST)"
             echo "Current size:  $CUR_H"
             echo "Possible max:  $MAX_H (using remaining free space)"
-            read -rp "Enlarge this partition now to use free space? (y/N): " ENL
+            ENL=$(read_yes_no "Enlarge this partition now to use free space? (y/N): ")
             if [[ "$ENL" =~ ^[Yy]$ ]]; then
               # Determine partition index number for sfdisk -N
               PNUM=$(echo "$LAST_PART_NAME" | grep -Eo '[0-9]+$' || true)
@@ -952,7 +946,7 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
   fi
 
   # Optional: fix low space on Linux root by growing ext4 to full partition and lowering reserved blocks
-  read -rp "Grow ext4 filesystem on TARGET to fill its partition and set reserved to 1%? (y/N): " GROW
+  GROW=$(read_yes_no "Grow ext4 filesystem on TARGET to fill its partition and set reserved to 1%? (y/N): ")
   if [[ "$GROW" =~ ^[Yy]$ ]]; then
     # Auto-detect single ext4 partition on target
     mapfile -t TGT_EXT4 < <(lsblk -ln -o NAME,FSTYPE "$DST" | awk '$2=="ext4" {print $1}')
@@ -980,5 +974,11 @@ fi
 ## Source re-grow feature removed
 
 echo "=== Done ==="
-echo "Cloned $SRC to $DST. If the target is larger, you may later expand partitions/filesystems."
+if [[ "$OP" =~ ^[Cc]$ ]]; then
+  echo "Cloned $SRC to $DST. If the target is larger, you may later expand partitions/filesystems."
+elif [[ "$OP" =~ ^[Aa]$ ]]; then
+  echo "Archived $SRC to $ARCH successfully."
+else
+  echo "Restored $ARCH to $DST successfully."
+fi
 
