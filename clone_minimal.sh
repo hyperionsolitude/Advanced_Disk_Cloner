@@ -655,7 +655,8 @@ else
         DISK_SECTORS=$(blockdev --getsz "$DST")
         # Parse original dump to collect partition sizes and types by index
         # Lines look like: /dev/nvme0n1p3 : start=     123, size=   456, type=...
-        mapfile -t DUMP_LINES < <(grep -E "^$DST(p|)[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
+        # Note: saved table contains SOURCE device names, not TARGET
+        mapfile -t DUMP_LINES < <(grep -E "^$SRC(p|)[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
         if [ ${#DUMP_LINES[@]} -eq 0 ]; then
           echo "WARN: Could not parse original partition table; falling back to original layout."
           sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
