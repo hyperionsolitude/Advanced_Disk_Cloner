@@ -11,6 +11,7 @@ require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; 
 # Self-test mode: validate environment and exit
 if [ "${1:-}" = "--self-test" ]; then
   echo "=== Self-test ==="
+  # shellcheck disable=SC1091
   echo "OS: $(. /etc/os-release 2>/dev/null || true; echo "${NAME:-unknown}")"
   echo "User: $(id -un) (EUID=${EUID:-$(id -u)})"
   echo "Checking commands..."
@@ -50,6 +51,7 @@ read_yes_no() {
 
 is_ubuntu() {
   if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
     . /etc/os-release
     [ "${ID:-}" = "ubuntu" ] || case ",${ID_LIKE:-}," in *,ubuntu,*|*,debian,*) return 1 ;; esac
     [ "${ID:-}" = "ubuntu" ] && return 0
@@ -142,8 +144,8 @@ require tar
 # Report archive capabilities
 HAS_PARTCLONE=no
 HAS_NTFSCLONE=no
-command -v partclone.extfs >/dev/null 2>&1 && HAS_PARTCLONE=yes || true
-command -v ntfsclone >/dev/null 2>&1 && HAS_NTFSCLONE=yes || true
+if command -v partclone.extfs >/dev/null 2>&1; then HAS_PARTCLONE=yes; fi
+if command -v ntfsclone >/dev/null 2>&1; then HAS_NTFSCLONE=yes; fi
 echo "Archive mode: used-block ext4=$HAS_PARTCLONE, ntfs=$HAS_NTFSCLONE (fallback to raw for others)"
 
 # Build numbered list of root disks: /dev/sd[a-z] and /dev/nvme*n1
@@ -622,7 +624,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
     fi
     mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
-    echo "\n[ARCH] Summary (partition, tool, status, size-bytes):" >&2
+    printf "\n[ARCH] Summary (partition, tool, status, size-bytes):\n" >&2
     sed -n '1,200p' "$STATUS_LOG" 2>/dev/null >&2 || true
     # Cleanup handled by trap
     sync
@@ -688,6 +690,7 @@ else
         # Lines look like: /dev/nvme0n1p3 : start=     123, size=   456, type=...
         # Note: saved table contains SOURCE device names, not TARGET
         # Escape SRC for use in extended regex (slashes and metachars)
+        # shellcheck disable=SC2016
         ESC_SRC=$(printf '%s' "$SRC" | sed -e 's/[.[\\*^$(){}+?|]/\\&/g' -e 's,/,\\/,g')
         mapfile -t DUMP_LINES < <(grep -E "^${ESC_SRC}(p|)[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
         if [ ${#DUMP_LINES[@]} -eq 0 ]; then
@@ -814,7 +817,8 @@ else
       sync
     fi
     # Map target partitions list
-    mapfile -t TPARTS < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2=="" {next} $2!="" {print $1}')
+    # Map target partitions list (kept for potential future diagnostics)
+    mapfile -t _TPARTS_UNUSED < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2=="" {next} $2!="" {print $1}')
     # If partial restore, collect selection from user
     declare -A __ADC_SELECTED
     if [ "${PARTIAL_RESTORE:-no}" = "yes" ]; then
@@ -991,17 +995,19 @@ fi
 
 if [[ "$OP" =~ ^[CcRr]$ ]]; then
   echo "=== Post-clone adjustments ==="
-  if command -v sgdisk >/dev/null 2>&1; then
-    echo "Fixing GPT backup on target (if needed)..."
-    sgdisk -e "$DST" || true
+  if [ "${PARTIAL_RESTORE:-no}" != "yes" ]; then
+    if command -v sgdisk >/dev/null 2>&1; then
+      echo "Fixing GPT backup on target (if needed)..."
+      sgdisk -e "$DST" || true
+    fi
   fi
   partprobe "$DST" || true
   sync
 
   # Print summary of partitions for both disks
-  echo "\n=== Source layout ==="
+  printf "\n=== Source layout ===\n"
   lsblk "$SRC"
-  echo "\n=== Target layout ==="
+  printf "\n=== Target layout ===\n"
   lsblk "$DST"
 
   # Offer to randomize GPT disk and partition GUIDs on target to avoid conflicts
@@ -1026,7 +1032,7 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
         done
         partprobe "$DST" || true
         sync
-        echo "\nNew target PARTUUIDs:"
+        printf "\nNew target PARTUUIDs:\n"
         lsblk -o NAME,PARTUUID "$DST" || true
         echo "NOTE: If the restored system uses PARTUUID/UUID in /etc/fstab or bootloader configs, you may need to update them on the target."
       fi
@@ -1054,9 +1060,9 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
           if [ "$MAX_BYTES" -gt "$CUR_BYTES" ]; then
             CUR_H=$(numfmt --to=iec "$CUR_BYTES" 2>/dev/null || echo "$CUR_BYTES bytes")
             MAX_H=$(numfmt --to=iec "$MAX_BYTES" 2>/dev/null || echo "$MAX_BYTES bytes")
-            echo "\nLast partition: $LAST_PART (fs=$FSTYPE_LAST)"
-            echo "Current size:  $CUR_H"
-            echo "Possible max:  $MAX_H (using remaining free space)"
+            printf "\nLast partition: %s (fs=%s)\n" "$LAST_PART" "$FSTYPE_LAST"
+            printf "Current size:  %s\n" "$CUR_H"
+            printf "Possible max:  %s (using remaining free space)\n" "$MAX_H"
             ENL=$(read_yes_no "Enlarge this partition now to use free space? (y/N): ")
             if [[ "$ENL" =~ ^[Yy]$ ]]; then
               # Determine partition index number for sfdisk -N
