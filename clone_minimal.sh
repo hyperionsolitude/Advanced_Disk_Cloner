@@ -15,7 +15,7 @@ if [ "${1:-}" = "--self-test" ]; then
   echo "OS: $(. /etc/os-release 2>/dev/null || true; echo "${NAME:-unknown}")"
   echo "User: $(id -un) (EUID=${EUID:-$(id -u)})"
   echo "Checking commands..."
-  for cmd in dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs; do
+  for cmd in dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs pigz; do
     if command -v "$cmd" >/dev/null 2>&1; then
       echo " - $cmd: OK"
     else
@@ -90,6 +90,7 @@ ensure_commands() {
     PKG_FOR_CMD[sfdisk]="util-linux"
     PKG_FOR_CMD[lsblk]="util-linux"
     PKG_FOR_CMD[gzip]="gzip"
+    PKG_FOR_CMD[pigz]="pigz"
     PKG_FOR_CMD[tar]="tar"
     PKG_FOR_CMD[pv]="pv"
     PKG_FOR_CMD[gdisk]="gdisk"
@@ -133,7 +134,7 @@ ensure_commands() {
 # Always attempt to install prerequisites on Ubuntu (non-fatal)
 echo "Ensuring required commands are available..."
 # Core + feature commands needed by this script
-ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs
+ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs pigz
 
 # Ensure minimally required commands exist after best-effort install
 require dd
@@ -330,16 +331,8 @@ elif [[ "$OP" =~ ^[Rr]$ ]]; then
   echo "TARGET: $DST (WILL BE ERASED)"
   read -rp "Type YES to confirm restore: " CONFIRM
   [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
-  # Partial restore support is only meaningful for per-partition archives (tar)
+  # Defer partial restore decision until after extraction to avoid double reading
   PARTIAL_RESTORE=no
-  if tar -tzf "$ARCH" >/dev/null 2>&1; then
-    PR=$(read_yes_no "Partial restore: restore only selected partitions? (y/N): ")
-    if [[ "$PR" =~ ^[Yy]$ ]]; then
-      PARTIAL_RESTORE=yes
-      echo "You chose partial restore. Partition table will NOT be modified."
-      echo "Ensure the target already has the desired partitions present."
-    fi
-  fi
 fi
 
 if [ "$LIVE_ON_SOURCE" -eq 1 ]; then
@@ -520,11 +513,19 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             echo -e "$PNAME\text4\tpartclone" >> "$MANIFEST"
             (
               set +e -o pipefail
-              if command -v pv >/dev/null 2>&1; then
-                partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
-              else
-                partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
-              fi
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | pigz -1 > "${OUTBASE}.pc.gz"
+      else
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pigz -1 > "${OUTBASE}.pc.gz"
+      else
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
+      fi
+    fi
             ); rc=$?
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.pc.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.pc.gz" 2>/dev/null || echo 0)
@@ -538,11 +539,19 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             echo -e "$PNAME\text4\tdd" >> "$MANIFEST"
             (
               set +e -o pipefail
-              if command -v pv >/dev/null 2>&1; then
-                dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
-              else
-                dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
-              fi
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=1M status=none | pv | pigz -1 > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=1M status=progress | pigz -1 > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+      fi
+    fi
             ); rc=$?
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
@@ -559,11 +568,19 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             echo -e "$PNAME\tntfs\tntfsclone" >> "$MANIFEST"
             (
               set +e -o pipefail
-              if command -v pv >/dev/null 2>&1; then
-                ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
-              else
-                ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
-              fi
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | pigz -1 > "${OUTBASE}.ntfs.gz"
+      else
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pigz -1 > "${OUTBASE}.ntfs.gz"
+      else
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
+      fi
+    fi
             ); rc=$?
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.ntfs.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.ntfs.gz" 2>/dev/null || echo 0)
@@ -577,11 +594,19 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             echo -e "$PNAME\tntfs\tdd" >> "$MANIFEST"
             (
               set +e -o pipefail
-              if command -v pv >/dev/null 2>&1; then
-                dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
-              else
-                dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
-              fi
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=1M status=none | pv | pigz -1 > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=1M status=progress | pigz -1 > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+      fi
+    fi
             ); rc=$?
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
@@ -598,11 +623,19 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
           echo -e "$PNAME\t$FST\tdd" >> "$MANIFEST"
           (
             set +e -o pipefail
-            if command -v pv >/dev/null 2>&1; then
-              dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
-            else
-              dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
-            fi
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=1M status=none | pv | pigz -1 > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=1M status=progress | pigz -1 > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+      fi
+    fi
           ); rc=$?
           if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
             sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
@@ -618,10 +651,14 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     # Package everything into a tarball (new-format archive) with progress
     echo "[ARCH] Packaging archive..." >&2
     PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
-    if command -v pv >/dev/null 2>&1 && [[ "$PKG_BYTES" =~ ^[0-9]+$ ]]; then
-      (cd "$TMPDIR" && tar -cz . | pv -s "$PKG_BYTES" > "$ARCH_TAR")
+    if command -v pigz >/dev/null 2>&1; then
+      (cd "$TMPDIR" && tar -I pigz -cf "$ARCH_TAR" .)
     else
-      (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
+      if command -v pv >/dev/null 2>&1 && [[ "$PKG_BYTES" =~ ^[0-9]+$ ]]; then
+        (cd "$TMPDIR" && tar -cz . | pv -s "$PKG_BYTES" > "$ARCH_TAR")
+      else
+        (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
+      fi
     fi
     mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
     printf "\n[ARCH] Summary (partition, tool, status, size-bytes):\n" >&2
@@ -631,29 +668,40 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   else
     # Legacy full-disk raw archive
     sfdisk -d "$SRC" > "${ARCH%.gz}.sfdisk" 2>/dev/null || true
-    if command -v pv >/dev/null 2>&1; then
-      dd if="$SRC" bs=1M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | gzip -1 > "$ARCH"
+    if command -v pigz >/dev/null 2>&1; then
+      dd if="$SRC" bs=1M conv=noerror,sync | pigz -1 > "$ARCH"
     else
-      dd if="$SRC" bs=1M status=progress conv=noerror,sync | gzip -1 > "$ARCH"
+      if command -v pv >/dev/null 2>&1; then
+        dd if="$SRC" bs=1M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | gzip -1 > "$ARCH"
+      else
+        dd if="$SRC" bs=1M status=progress conv=noerror,sync | gzip -1 > "$ARCH"
+      fi
     fi
     sync
   fi
 else
   # Restore from archive to target device
-  if tar -tzf "$ARCH" >/dev/null 2>&1; then
-    # New-format per-partition archive
-    # Create temporary workspace on the same filesystem as the archive (not /tmp)
-    # If TMPDIR was already prepared/announced before, reuse it
-    ARCH_DIRNAME=$(dirname "$ARCH")
-    mkdir -p "$ARCH_DIRNAME"
-    if [ -z "${TMPDIR:-}" ]; then
-      if [ -n "${ADC_TMPDIR:-}" ]; then
-        TMPDIR="$ADC_TMPDIR"; mkdir -p "$TMPDIR"
-      else
-        TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
-      fi
-      echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
+  # Attempt single-pass extraction; if it fails, fall back to legacy raw restore
+  ARCH_IS_TAR=no
+  ARCH_DIRNAME=$(dirname "$ARCH")
+  mkdir -p "$ARCH_DIRNAME"
+  if [ -z "${TMPDIR:-}" ]; then
+    if [ -n "${ADC_TMPDIR:-}" ]; then
+      TMPDIR="$ADC_TMPDIR"; mkdir -p "$TMPDIR"
+    else
+      TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
     fi
+    echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
+  fi
+  echo "[RESTORE] Extracting archive..." >&2
+  # Stream extraction directly via tar to avoid any pre-read overhead
+  if command -v pigz >/dev/null 2>&1; then
+    # tar will automatically use pigz for .gz when specified via -I
+    if tar --no-same-owner -I pigz -x -f "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
+  else
+    if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
+  fi
+  if [ "$ARCH_IS_TAR" = "yes" ]; then
     cleanup_tmp() {
       # Only remove temp if RESTORE_OK=yes; keep on failure for diagnostics
       if [ "${RESTORE_OK:-no}" = "yes" ]; then
@@ -663,18 +711,16 @@ else
       fi
     }
     trap 'cleanup_tmp' EXIT INT TERM HUP
-    echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
-    echo "[RESTORE] Extracting archive..." >&2
-    if command -v pv >/dev/null 2>&1; then
-      ARCH_BYTES=$(stat -c %s "$ARCH" 2>/dev/null || echo 0)
-      if [[ "$ARCH_BYTES" =~ ^[0-9]+$ ]] && [ "$ARCH_BYTES" -gt 0 ]; then
-        pv -s "$ARCH_BYTES" "$ARCH" | tar --no-same-owner -xz -C "$TMPDIR"
-      else
-        tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"
+    # Decide on partial restore now that archive is extracted and manifest is available
+    if [ -f "$TMPDIR/manifest.tsv" ]; then
+      PR=$(read_yes_no "Partial restore: restore only selected partitions? (y/N): ")
+      if [[ "$PR" =~ ^[Yy]$ ]]; then
+        PARTIAL_RESTORE=yes
+        echo "You chose partial restore. Partition table will NOT be modified."
+        echo "Ensure the target already has the desired partitions present."
       fi
-    else
-      tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"
     fi
+
     # Recreate partition table (optionally compact/resize before restore)
     # Skip if partial restore is requested
     if [ "${PARTIAL_RESTORE:-no}" != "yes" ] && [ -f "$TMPDIR/partition_table.sfdisk" ]; then
@@ -688,14 +734,11 @@ else
         } >&2
         # Parse original dump to collect partition sizes and types by index
         # Lines look like: /dev/nvme0n1p3 : start=     123, size=   456, type=...
-        # Note: saved table contains SOURCE device names, not TARGET
-        # Escape SRC for use in extended regex (slashes and metachars)
-        # shellcheck disable=SC2016
-        ESC_SRC=$(printf '%s' "$SRC" | sed -e 's/[.[\\*^$(){}+?|]/\\&/g' -e 's,/,\\/,g')
-        mapfile -t DUMP_LINES < <(grep -E "^${ESC_SRC}(p|)[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
+        # Do not depend on current SRC name; match any /dev/* partition lines
+        mapfile -t DUMP_LINES < <(grep -E "^/dev/[^[:space:]]*[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
         if [ ${#DUMP_LINES[@]} -eq 0 ]; then
           {
-            echo "[RESTORE][DIAG] WARN: Could not parse original partition table for SRC=$SRC"
+            echo "[RESTORE][DIAG] WARN: Could not parse any partition entries from saved table"
             echo "[RESTORE][DIAG] Showing first 20 lines of saved partition table:"
             sed -n '1,20p' "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
             echo "[RESTORE][DIAG] Falling back to original layout via sfdisk import."
@@ -876,24 +919,40 @@ else
         case "$TOOL" in
           partclone)
             if [ -f "${BASE}.pc.gz" ] && command -v partclone.extfs >/dev/null 2>&1; then
-              gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+              if command -v pigz >/dev/null 2>&1; then
+                pigz -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+              else
+                gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+              fi
             else
               echo "WARN: missing partclone image or tool for $PNAME"
             fi
             ;;
           ntfsclone)
             if [ -f "${BASE}.ntfs.gz" ] && command -v ntfsclone >/dev/null 2>&1; then
-              gzip -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
+              if command -v pigz >/dev/null 2>&1; then
+                pigz -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
+              else
+                gzip -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
+              fi
             else
               echo "WARN: missing ntfsclone image or tool for $PNAME"
             fi
             ;;
           dd)
             if [ -f "${BASE}.raw.gz" ]; then
-              if command -v pv >/dev/null 2>&1; then
-                gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+              if command -v pigz >/dev/null 2>&1; then
+                if command -v pv >/dev/null 2>&1; then
+                  pigz -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+                else
+                  pigz -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                fi
               else
-                gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                if command -v pv >/dev/null 2>&1; then
+                  gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+                else
+                  gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                fi
               fi
             else
               echo "WARN: missing raw image for $PNAME"
@@ -910,17 +969,21 @@ else
     echo "[RESTORE] Restore completed successfully." >&2
   else
     # Legacy full-disk raw archive
-    if command -v pv >/dev/null 2>&1; then
-      pv "$ARCH" | gzip -dc | dd of="$DST" bs=1M conv=fsync
+    if command -v pigz >/dev/null 2>&1; then
+      pigz -dc "$ARCH" | dd of="$DST" bs=1M conv=fsync
     else
-      gzip -dc "$ARCH" | dd of="$DST" bs=1M status=progress conv=fsync
+      if command -v pv >/dev/null 2>&1; then
+        pv "$ARCH" | gzip -dc | dd of="$DST" bs=1M conv=fsync
+      else
+        gzip -dc "$ARCH" | dd of="$DST" bs=1M status=progress conv=fsync
+      fi
     fi
     echo "[RESTORE] Restore completed successfully." >&2
   fi
   sync
 
   # Offer retry on failure (only for per-partition archives)
-  if [ "${RESTORE_OK:-no}" != "yes" ] && [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ]; then
+  if [ "${RESTORE_OK:-no}" != "yes" ] && [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && [ -f "$TMPDIR/manifest.tsv" ]; then
     echo "[RESTORE] Restore failed. Temp workspace kept: $TMPDIR" >&2
     read -rp "Retry restore with same settings? (y/N): " RETRY
     if [[ "$RETRY" =~ ^[Yy]$ ]]; then
