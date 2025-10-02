@@ -328,6 +328,16 @@ elif [[ "$OP" =~ ^[Rr]$ ]]; then
   echo "TARGET: $DST (WILL BE ERASED)"
   read -rp "Type YES to confirm restore: " CONFIRM
   [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
+  # Partial restore support is only meaningful for per-partition archives (tar)
+  PARTIAL_RESTORE=no
+  if tar -tzf "$ARCH" >/dev/null 2>&1; then
+    PR=$(read_yes_no "Partial restore: restore only selected partitions? (y/N): ")
+    if [[ "$PR" =~ ^[Yy]$ ]]; then
+      PARTIAL_RESTORE=yes
+      echo "You chose partial restore. Partition table will NOT be modified."
+      echo "Ensure the target already has the desired partitions present."
+    fi
+  fi
 fi
 
 if [ "$LIVE_ON_SOURCE" -eq 1 ]; then
@@ -664,7 +674,8 @@ else
       tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"
     fi
     # Recreate partition table (optionally compact/resize before restore)
-    if [ -f "$TMPDIR/partition_table.sfdisk" ]; then
+    # Skip if partial restore is requested
+    if [ "${PARTIAL_RESTORE:-no}" != "yes" ] && [ -f "$TMPDIR/partition_table.sfdisk" ]; then
       COMPACT=$(read_yes_no "Compact restore: pack partitions contiguously (preserve numbers)? (y/N): ")
       if [[ "$COMPACT" =~ ^[Yy]$ ]]; then
         SECTOR_SIZE=$(blockdev --getss "$DST")
@@ -804,12 +815,48 @@ else
     fi
     # Map target partitions list
     mapfile -t TPARTS < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2=="" {next} $2!="" {print $1}')
+    # If partial restore, collect selection from user
+    declare -A __ADC_SELECTED
+    if [ "${PARTIAL_RESTORE:-no}" = "yes" ]; then
+      if [ -f "$TMPDIR/manifest.tsv" ]; then
+        echo "Available partitions in archive (index: fs tool):"
+        while IFS=$'\t' read -r PNAME FSTOOL TOOL; do
+          IDX=$(echo "$PNAME" | grep -Eo '[0-9]+$' || true)
+          [ -n "$IDX" ] || continue
+          echo " - $IDX: ${FSTOOL:-unknown} via ${TOOL:-?}"
+        done < "$TMPDIR/manifest.tsv"
+        read -rp "Enter partition numbers to restore (comma-separated, ranges ok e.g. 1,3-5): " __ADC_SEL
+        # Parse selection into map
+        IFS=',' read -r -a __ADC_ARR <<< "$__ADC_SEL"
+        for tok in "${__ADC_ARR[@]}"; do
+          tok_trim=$(echo "$tok" | sed 's/^ *//;s/ *$//')
+          if [[ "$tok_trim" =~ ^[0-9]+-[0-9]+$ ]]; then
+            a=$(echo "$tok_trim" | cut -d- -f1)
+            b=$(echo "$tok_trim" | cut -d- -f2)
+            if [[ "$a" =~ ^[0-9]+$ ]] && [[ "$b" =~ ^[0-9]+$ ]] && [ "$a" -le "$b" ]; then
+              for ((j=a; j<=b; j++)); do __ADC_SELECTED[$j]=1; done
+            fi
+          elif [[ "$tok_trim" =~ ^[0-9]+$ ]]; then
+            __ADC_SELECTED[$tok_trim]=1
+          fi
+        done
+        if [ ${#__ADC_SELECTED[@]} -eq 0 ]; then
+          echo "No valid partitions selected; cancelling."; exit 1
+        fi
+      else
+        echo "ERROR: manifest.tsv not found in archive"; exit 1
+      fi
+    fi
     # Restore per manifest order
     if [ -f "$TMPDIR/manifest.tsv" ]; then
       while IFS=$'\t' read -r PNAME FSTOOL TOOL; do
         # Resolve target dev by partition number suffix in PNAME
         # Extract numeric part index at end (e.g., sda3 -> 3, nvme0n1p2 -> 2)
         IDX=$(echo "$PNAME" | grep -Eo '[0-9]+$' || true)
+        # If partial restore, skip entries not chosen
+        if [ "${PARTIAL_RESTORE:-no}" = "yes" ]; then
+          [ -n "$IDX" ] && [ -n "${__ADC_SELECTED[$IDX]:-}" ] || { echo "[RESTORE] Skipping partition $IDX (not selected)" >&2; continue; }
+        fi
         TDEV=""
         if [ -n "$IDX" ]; then
           # Find ${DST}${suffix} pattern
@@ -958,34 +1005,36 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
   lsblk "$DST"
 
   # Offer to randomize GPT disk and partition GUIDs on target to avoid conflicts
-  if command -v sgdisk >/dev/null 2>&1; then
-    RAND_GUIDS=$(read_yes_no "Randomize GPT disk and partition GUIDs on TARGET to avoid conflicts with SOURCE? (y/N): ")
-    if [[ "$RAND_GUIDS" =~ ^[Yy]$ ]]; then
-      echo "Randomizing disk GUID on $DST..."
-      sgdisk -G "$DST" || true
-      # Randomize each partition's PARTUUID
-      mapfile -t TP_PARTS < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2!=""{print $1}')
-      for pn in "${TP_PARTS[@]}"; do
-        # Extract numeric index from partition name
-        PNUM=$(echo "$pn" | grep -Eo '[0-9]+$' || true)
-        if [[ "$PNUM" =~ ^[0-9]+$ ]]; then
-          NEWGUID=$(uuidgen 2>/dev/null || echo "")
-          if [ -n "$NEWGUID" ]; then
-            echo "Setting new PARTUUID for partition $PNUM ($pn)..."
-            sgdisk -u="$PNUM:$NEWGUID" "$DST" || true
+  if [ "${PARTIAL_RESTORE:-no}" != "yes" ]; then
+    if command -v sgdisk >/dev/null 2>&1; then
+      RAND_GUIDS=$(read_yes_no "Randomize GPT disk and partition GUIDs on TARGET to avoid conflicts with SOURCE? (y/N): ")
+      if [[ "$RAND_GUIDS" =~ ^[Yy]$ ]]; then
+        echo "Randomizing disk GUID on $DST..."
+        sgdisk -G "$DST" || true
+        # Randomize each partition's PARTUUID
+        mapfile -t TP_PARTS < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2!=""{print $1}')
+        for pn in "${TP_PARTS[@]}"; do
+          # Extract numeric index from partition name
+          PNUM=$(echo "$pn" | grep -Eo '[0-9]+$' || true)
+          if [[ "$PNUM" =~ ^[0-9]+$ ]]; then
+            NEWGUID=$(uuidgen 2>/dev/null || echo "")
+            if [ -n "$NEWGUID" ]; then
+              echo "Setting new PARTUUID for partition $PNUM ($pn)..."
+              sgdisk -u="$PNUM:$NEWGUID" "$DST" || true
+            fi
           fi
-        fi
-      done
-      partprobe "$DST" || true
-      sync
-      echo "\nNew target PARTUUIDs:"
-      lsblk -o NAME,PARTUUID "$DST" || true
-      echo "NOTE: If the restored system uses PARTUUID/UUID in /etc/fstab or bootloader configs, you may need to update them on the target."
+        done
+        partprobe "$DST" || true
+        sync
+        echo "\nNew target PARTUUIDs:"
+        lsblk -o NAME,PARTUUID "$DST" || true
+        echo "NOTE: If the restored system uses PARTUUID/UUID in /etc/fstab or bootloader configs, you may need to update them on the target."
+      fi
     fi
   fi
 
   # Offer to enlarge the last growable partition on restore to use remaining free space
-  if [[ "$OP" =~ ^[Rr]$ ]]; then
+  if [[ "$OP" =~ ^[Rr]$ ]] && [ "${PARTIAL_RESTORE:-no}" != "yes" ]; then
     # Identify last partition device on target
     LAST_PART_NAME=$(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2!="" {print $1}' | tail -n1)
     if [ -n "$LAST_PART_NAME" ]; then
@@ -1045,8 +1094,9 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
   fi
 
   # Optional: fix low space on Linux root by growing ext4 to full partition and lowering reserved blocks
-  GROW=$(read_yes_no "Grow ext4 filesystem on TARGET to fill its partition and set reserved to 1%? (y/N): ")
-  if [[ "$GROW" =~ ^[Yy]$ ]]; then
+  if [ "${PARTIAL_RESTORE:-no}" != "yes" ]; then
+    GROW=$(read_yes_no "Grow ext4 filesystem on TARGET to fill its partition and set reserved to 1%? (y/N): ")
+    if [[ "$GROW" =~ ^[Yy]$ ]]; then
     # Auto-detect single ext4 partition on target
     mapfile -t TGT_EXT4 < <(lsblk -ln -o NAME,FSTYPE "$DST" | awk '$2=="ext4" {print $1}')
     if [ ${#TGT_EXT4[@]} -eq 1 ]; then
@@ -1063,6 +1113,7 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
       fi
     else
       echo "Skip grow: ext4 auto-detect ambiguous or none found on target (${#TGT_EXT4[@]} candidates)."
+    fi
     fi
   fi
 else
