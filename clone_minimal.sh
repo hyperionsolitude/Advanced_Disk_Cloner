@@ -444,6 +444,17 @@ else
   if [[ "$OP" =~ ^[Aa]$ ]]; then
     echo "=== Start archive: $SRC → $ARCH ==="
   else
+    # Prepare/announce restore temp workspace BEFORE starting restore
+    ARCH_DIRNAME=$(dirname "$ARCH")
+    mkdir -p "$ARCH_DIRNAME"
+    if [ -n "${ADC_TMPDIR:-}" ]; then
+      TMPDIR="$ADC_TMPDIR"
+      mkdir -p "$TMPDIR"
+    else
+      TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
+    fi
+    echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
+    export TMPDIR
     echo "=== Start restore: $ARCH → $DST ==="
   fi
 fi
@@ -466,9 +477,15 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     esac
     ARCH_DIRNAME=$(dirname "$ARCH_TAR")
     mkdir -p "$ARCH_DIRNAME"
-    TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
+    if [ -n "${ADC_TMPDIR:-}" ]; then
+      TMPDIR="$ADC_TMPDIR"
+      mkdir -p "$TMPDIR"
+    else
+      TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
+    fi
     cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
     trap 'cleanup_tmp' EXIT INT TERM HUP
+    echo "[ARCH] Using temp workspace: $TMPDIR" >&2
     MANIFEST="$TMPDIR/manifest.tsv"
     STATUS_LOG="$TMPDIR/status.tsv"
     : > "$MANIFEST"
@@ -614,9 +631,17 @@ else
   if tar -tzf "$ARCH" >/dev/null 2>&1; then
     # New-format per-partition archive
     # Create temporary workspace on the same filesystem as the archive (not /tmp)
+    # If TMPDIR was already prepared/announced before, reuse it
     ARCH_DIRNAME=$(dirname "$ARCH")
     mkdir -p "$ARCH_DIRNAME"
-    TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
+    if [ -z "${TMPDIR:-}" ]; then
+      if [ -n "${ADC_TMPDIR:-}" ]; then
+        TMPDIR="$ADC_TMPDIR"; mkdir -p "$TMPDIR"
+      else
+        TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
+      fi
+      echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
+    fi
     cleanup_tmp() {
       # Only remove temp if RESTORE_OK=yes; keep on failure for diagnostics
       if [ "${RESTORE_OK:-no}" = "yes" ]; then
@@ -626,6 +651,7 @@ else
       fi
     }
     trap 'cleanup_tmp' EXIT INT TERM HUP
+    echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
     echo "[RESTORE] Extracting archive..." >&2
     if command -v pv >/dev/null 2>&1; then
       ARCH_BYTES=$(stat -c %s "$ARCH" 2>/dev/null || echo 0)
@@ -643,12 +669,23 @@ else
       if [[ "$COMPACT" =~ ^[Yy]$ ]]; then
         SECTOR_SIZE=$(blockdev --getss "$DST")
         DISK_SECTORS=$(blockdev --getsz "$DST")
+        {
+          echo "[RESTORE][DIAG] Compact mode enabled"
+          echo "[RESTORE][DIAG] Target: $DST  sector_size=$SECTOR_SIZE  disk_sectors=$DISK_SECTORS"
+        } >&2
         # Parse original dump to collect partition sizes and types by index
         # Lines look like: /dev/nvme0n1p3 : start=     123, size=   456, type=...
         # Note: saved table contains SOURCE device names, not TARGET
-        mapfile -t DUMP_LINES < <(grep -E "^$SRC(p|)[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
+        # Escape SRC for use in extended regex (slashes and metachars)
+        ESC_SRC=$(printf '%s' "$SRC" | sed -e 's/[.[\\*^$(){}+?|]/\\&/g' -e 's,/,\\/,g')
+        mapfile -t DUMP_LINES < <(grep -E "^${ESC_SRC}(p|)[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
         if [ ${#DUMP_LINES[@]} -eq 0 ]; then
-          echo "WARN: Could not parse original partition table; falling back to original layout."
+          {
+            echo "[RESTORE][DIAG] WARN: Could not parse original partition table for SRC=$SRC"
+            echo "[RESTORE][DIAG] Showing first 20 lines of saved partition table:"
+            sed -n '1,20p' "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
+            echo "[RESTORE][DIAG] Falling back to original layout via sfdisk import."
+          } >&2
           sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
         else
           # Build arrays: IDX -> TYPE, SIZE_SECT
@@ -656,7 +693,8 @@ else
           declare -A TYPE_BY_IDX
           declare -A SIZE_BY_IDX
           for ln in "${DUMP_LINES[@]}"; do
-            idx=$(printf '%s' "$ln" | grep -Eo '[0-9]+(?=\s*:)' | tail -n1)
+            # Extract trailing digits before the first ':' (partition index)
+            idx=$(printf '%s' "$ln" | sed -E 's/^.*[^0-9]([0-9]+)[[:space:]]*:.*/\1/' | tail -n1)
             type=$(printf '%s' "$ln" | awk -F'type=' 'NF>1{print $2}' | awk -F',' '{print $1}' | sed 's/[[:space:]]//g')
             size=$(printf '%s' "$ln" | awk -F'size=' 'NF>1{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
             if [[ "$idx" =~ ^[0-9]+$ ]] && [[ "$size" =~ ^[0-9]+$ ]]; then
@@ -665,6 +703,12 @@ else
               SIZE_BY_IDX[$idx]="$size"
             fi
           done
+          {
+            echo "[RESTORE][DIAG] Parsed partitions from dump (index:type:size_sectors):"
+            for i in "${PART_INDEXES[@]}"; do
+              echo "[RESTORE][DIAG]  $i:${TYPE_BY_IDX[$i]:-?}:${SIZE_BY_IDX[$i]:-?}"
+            done
+          } >&2
           # Discover filesystems to allow enlargement prompts (ext4/ntfs only)
           declare -A FS_BY_IDX
           while IFS=$'\t' read -r PNAME FFS TOOL; do
@@ -681,6 +725,10 @@ else
             sum=0
             for i in "${PART_INDEXES[@]}"; do sum=$((sum + SIZE_BY_IDX[$i])); done
             FREE=$((DISK_SECTORS - sum))
+            {
+              echo "[RESTORE][DIAG] Enlargement requested"
+              echo "[RESTORE][DIAG] Sum(original sizes in sectors)=$sum  Free(sectors)=$FREE"
+            } >&2
             for i in "${PART_INDEXES[@]}"; do
               fs="${FS_BY_IDX[$i]:-}"
               if [ "$fs" = "ext4" ] || [ "$fs" = "ntfs" ]; then
@@ -698,6 +746,9 @@ else
                     else
                       SIZE_NEW[$i]=$((cur + add_sect))
                       FREE=$((FREE - add_sect))
+                      {
+                        echo "[RESTORE][DIAG]  Enlarged partition $i by $add_sect sectors; FREE now $FREE"
+                      } >&2
                     fi
                   else
                     echo "WARN: invalid sector size; skipping."
@@ -721,11 +772,32 @@ else
               fi
             done
           } > "$NEWTAB"
-          sfdisk "$DST" < "$NEWTAB"
+          {
+            echo "[RESTORE][DIAG] Generated compact sfdisk table:";
+            sed -n '1,200p' "$NEWTAB" || true;
+          } >&2
+          SF_OUT=$(sfdisk "$DST" < "$NEWTAB" 2>&1); SF_RC=$?
+          if [ $SF_RC -ne 0 ]; then
+            {
+              echo "[RESTORE][DIAG][ERROR] sfdisk failed with code $SF_RC"
+              echo "[RESTORE][DIAG][ERROR] sfdisk output:"; echo "$SF_OUT"
+            } >&2
+          fi
           rm -f "$NEWTAB"
         fi
       else
-        sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
+        {
+          echo "[RESTORE][DIAG] Compact mode disabled. Importing original sfdisk table."
+          echo "[RESTORE][DIAG] Preview (first 20 lines):"
+          sed -n '1,20p' "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
+        } >&2
+        SF_OUT=$(sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk" 2>&1); SF_RC=$?
+        if [ $SF_RC -ne 0 ]; then
+          {
+            echo "[RESTORE][DIAG][ERROR] sfdisk failed with code $SF_RC"
+            echo "[RESTORE][DIAG][ERROR] sfdisk output:"; echo "$SF_OUT"
+          } >&2
+        fi
       fi
       partprobe "$DST" || true
       sync
@@ -884,6 +956,33 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
   lsblk "$SRC"
   echo "\n=== Target layout ==="
   lsblk "$DST"
+
+  # Offer to randomize GPT disk and partition GUIDs on target to avoid conflicts
+  if command -v sgdisk >/dev/null 2>&1; then
+    RAND_GUIDS=$(read_yes_no "Randomize GPT disk and partition GUIDs on TARGET to avoid conflicts with SOURCE? (y/N): ")
+    if [[ "$RAND_GUIDS" =~ ^[Yy]$ ]]; then
+      echo "Randomizing disk GUID on $DST..."
+      sgdisk -G "$DST" || true
+      # Randomize each partition's PARTUUID
+      mapfile -t TP_PARTS < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2!=""{print $1}')
+      for pn in "${TP_PARTS[@]}"; do
+        # Extract numeric index from partition name
+        PNUM=$(echo "$pn" | grep -Eo '[0-9]+$' || true)
+        if [[ "$PNUM" =~ ^[0-9]+$ ]]; then
+          NEWGUID=$(uuidgen 2>/dev/null || echo "")
+          if [ -n "$NEWGUID" ]; then
+            echo "Setting new PARTUUID for partition $PNUM ($pn)..."
+            sgdisk -u="$PNUM:$NEWGUID" "$DST" || true
+          fi
+        fi
+      done
+      partprobe "$DST" || true
+      sync
+      echo "\nNew target PARTUUIDs:"
+      lsblk -o NAME,PARTUUID "$DST" || true
+      echo "NOTE: If the restored system uses PARTUUID/UUID in /etc/fstab or bootloader configs, you may need to update them on the target."
+    fi
+  fi
 
   # Offer to enlarge the last growable partition on restore to use remaining free space
   if [[ "$OP" =~ ^[Rr]$ ]]; then
