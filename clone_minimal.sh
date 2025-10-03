@@ -6,6 +6,15 @@
 
 set -euo pipefail
 
+# Verbosity control: pass -v or --verbose to enable diagnostic logs
+VERBOSE=${VERBOSE:-no}
+for __arg in "$@"; do
+  case "$__arg" in
+    -v|--verbose) VERBOSE=yes ;;
+  esac
+done
+diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
+
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
 # Self-test mode: validate environment and exit
@@ -458,7 +467,7 @@ else
     else
       TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
     fi
-    echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
+    diag "[RESTORE] Using temp workspace: $TMPDIR"
     export TMPDIR
     echo "=== Start restore: $ARCH → $DST ==="
   fi
@@ -490,7 +499,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     fi
     cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
     trap 'cleanup_tmp' EXIT INT TERM HUP
-    echo "[ARCH] Using temp workspace: $TMPDIR" >&2
+    diag "[ARCH] Using temp workspace: $TMPDIR"
     MANIFEST="$TMPDIR/manifest.tsv"
     STATUS_LOG="$TMPDIR/status.tsv"
     : > "$MANIFEST"
@@ -504,7 +513,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       FST=$(echo -e   "$line" | awk -F"\t" '{print $2}')
       DEV="/dev/$PNAME"
       OUTBASE="$TMPDIR/part-${PNAME}"
-      echo "[ARCH] Start: $PNAME (fs=${FST:-unknown})" >&2
+      diag "[ARCH] Start: $PNAME (fs=${FST:-unknown})"
       case "$FST" in
         ext4)
           # If partition is mounted (e.g., root), avoid partclone and fallback to dd
@@ -530,7 +539,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.pc.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.pc.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tpartclone\tOK\t$sz" >> "$STATUS_LOG"
-              echo "[ARCH] Done: $PNAME via partclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
+              diag "[ARCH] Done: $PNAME via partclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
             else
               echo -e "$PNAME\tpartclone\tFAIL\t0" >> "$STATUS_LOG"
               echo "[ARCH] FAIL: $PNAME via partclone (rc=$rc)" >&2
@@ -556,7 +565,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
-              echo "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
+              diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
             else
               echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
               echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
@@ -585,7 +594,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.ntfs.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.ntfs.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tntfsclone\tOK\t$sz" >> "$STATUS_LOG"
-              echo "[ARCH] Done: $PNAME via ntfsclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
+              diag "[ARCH] Done: $PNAME via ntfsclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
             else
               echo -e "$PNAME\tntfsclone\tFAIL\t0" >> "$STATUS_LOG"
               echo "[ARCH] FAIL: $PNAME via ntfsclone (rc=$rc)" >&2
@@ -611,7 +620,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
-              echo "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
+              diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
             else
               echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
               echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
@@ -640,7 +649,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
           if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
             sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
             echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
-            echo "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))" >&2
+            diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
           else
             echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
             echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
@@ -649,7 +658,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       esac
     done
     # Package everything into a tarball (new-format archive) with progress
-    echo "[ARCH] Packaging archive..." >&2
+    diag "[ARCH] Packaging archive..."
     PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
     if command -v pigz >/dev/null 2>&1; then
       (cd "$TMPDIR" && tar -I pigz -cf "$ARCH_TAR" .)
@@ -661,8 +670,8 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       fi
     fi
     mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
-    printf "\n[ARCH] Summary (partition, tool, status, size-bytes):\n" >&2
-    sed -n '1,200p' "$STATUS_LOG" 2>/dev/null >&2 || true
+    diag "\n[ARCH] Summary (partition, tool, status, size-bytes):"
+    if [ "$VERBOSE" = "yes" ]; then sed -n '1,200p' "$STATUS_LOG" 2>/dev/null >&2 || true; fi
     # Cleanup handled by trap
     sync
   else
@@ -691,9 +700,9 @@ else
     else
       TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
     fi
-    echo "[RESTORE] Using temp workspace: $TMPDIR" >&2
+    diag "[RESTORE] Using temp workspace: $TMPDIR"
   fi
-  echo "[RESTORE] Extracting archive..." >&2
+  diag "[RESTORE] Extracting archive..."
   # Stream extraction directly via tar to avoid any pre-read overhead
   if command -v pigz >/dev/null 2>&1; then
     # tar will automatically use pigz for .gz when specified via -I
@@ -739,9 +748,8 @@ else
         if [ ${#DUMP_LINES[@]} -eq 0 ]; then
           {
             echo "[RESTORE][DIAG] WARN: Could not parse any partition entries from saved table"
-            echo "[RESTORE][DIAG] Showing first 20 lines of saved partition table:"
-            sed -n '1,20p' "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
-            echo "[RESTORE][DIAG] Falling back to original layout via sfdisk import."
+            if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG] Showing first 20 lines of saved partition table:" >&2; sed -n '1,20p' "$TMPDIR/partition_table.sfdisk" 2>/dev/null >&2 || true; fi
+            diag "[RESTORE][DIAG] Falling back to original layout via sfdisk import."
           } >&2
           sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
         else
@@ -760,12 +768,10 @@ else
               SIZE_BY_IDX[$idx]="$size"
             fi
           done
-          {
-            echo "[RESTORE][DIAG] Parsed partitions from dump (index:type:size_sectors):"
-            for i in "${PART_INDEXES[@]}"; do
-              echo "[RESTORE][DIAG]  $i:${TYPE_BY_IDX[$i]:-?}:${SIZE_BY_IDX[$i]:-?}"
-            done
-          } >&2
+          if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG] Parsed partitions from dump (index:type:size_sectors):" >&2; fi
+          for i in "${PART_INDEXES[@]}"; do
+            if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG]  $i:${TYPE_BY_IDX[$i]:-?}:${SIZE_BY_IDX[$i]:-?}" >&2; fi
+          done
           # Discover filesystems to allow enlargement prompts (ext4/ntfs only)
           declare -A FS_BY_IDX
           while IFS=$'\t' read -r PNAME FFS TOOL; do
@@ -829,15 +835,12 @@ else
               fi
             done
           } > "$NEWTAB"
-          {
-            echo "[RESTORE][DIAG] Generated compact sfdisk table:";
-            sed -n '1,200p' "$NEWTAB" || true;
-          } >&2
+          if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG] Generated compact sfdisk table:" >&2; sed -n '1,200p' "$NEWTAB" 2>/dev/null >&2 || true; fi
           SF_OUT=$(sfdisk "$DST" < "$NEWTAB" 2>&1); SF_RC=$?
           if [ $SF_RC -ne 0 ]; then
             {
-              echo "[RESTORE][DIAG][ERROR] sfdisk failed with code $SF_RC"
-              echo "[RESTORE][DIAG][ERROR] sfdisk output:"; echo "$SF_OUT"
+              echo "[RESTORE][DIAG][ERROR] sfdisk failed with code $SF_RC" >&2
+              echo "[RESTORE][DIAG][ERROR] sfdisk output:" >&2; echo "$SF_OUT" >&2
             } >&2
           fi
           rm -f "$NEWTAB"
@@ -845,14 +848,13 @@ else
       else
         {
           echo "[RESTORE][DIAG] Compact mode disabled. Importing original sfdisk table."
-          echo "[RESTORE][DIAG] Preview (first 20 lines):"
-          sed -n '1,20p' "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
+          if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG] Preview (first 20 lines):" >&2; sed -n '1,20p' "$TMPDIR/partition_table.sfdisk" 2>/dev/null >&2 || true; fi
         } >&2
         SF_OUT=$(sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk" 2>&1); SF_RC=$?
         if [ $SF_RC -ne 0 ]; then
           {
-            echo "[RESTORE][DIAG][ERROR] sfdisk failed with code $SF_RC"
-            echo "[RESTORE][DIAG][ERROR] sfdisk output:"; echo "$SF_OUT"
+            echo "[RESTORE][DIAG][ERROR] sfdisk failed with code $SF_RC" >&2
+            echo "[RESTORE][DIAG][ERROR] sfdisk output:" >&2; echo "$SF_OUT" >&2
           } >&2
         fi
       fi
@@ -902,7 +904,7 @@ else
         IDX=$(echo "$PNAME" | grep -Eo '[0-9]+$' || true)
         # If partial restore, skip entries not chosen
         if [ "${PARTIAL_RESTORE:-no}" = "yes" ]; then
-          [ -n "$IDX" ] && [ -n "${__ADC_SELECTED[$IDX]:-}" ] || { echo "[RESTORE] Skipping partition $IDX (not selected)" >&2; continue; }
+          [ -n "$IDX" ] && [ -n "${__ADC_SELECTED[$IDX]:-}" ] || { diag "[RESTORE] Skipping partition $IDX (not selected)"; continue; }
         fi
         TDEV=""
         if [ -n "$IDX" ]; then
@@ -1051,7 +1053,7 @@ else
         done < "$TMPDIR/manifest.tsv"
       fi
       RESTORE_OK=yes
-      echo "[RESTORE] Retry completed." >&2
+      diag "[RESTORE] Retry completed."
     fi
   fi
 fi
