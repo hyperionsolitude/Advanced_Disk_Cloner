@@ -15,6 +15,10 @@ for __arg in "$@"; do
 done
 diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
 
+# Performance tuning defaults
+THREADS=${THREADS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 2)}
+PIGZ_ARGS=${PIGZ_ARGS:--1 -p ${THREADS}}
+
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
 # Self-test mode: validate environment and exit
@@ -474,9 +478,9 @@ else
 fi
 if [[ "$OP" =~ ^[Cc]$ ]]; then
   if command -v pv >/dev/null 2>&1; then
-    dd if="$SRC" bs=1M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | dd of="$DST" bs=1M conv=fsync
+    dd if="$SRC" bs=16M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | dd of="$DST" bs=16M conv=fsync
   else
-    dd if="$SRC" of="$DST" bs=1M status=progress conv=noerror,sync,fsync
+    dd if="$SRC" of="$DST" bs=16M status=progress conv=noerror,sync,fsync
   fi
   sync
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
@@ -524,13 +528,13 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | pigz -1 > "${OUTBASE}.pc.gz"
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
       else
         partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pigz -1 > "${OUTBASE}.pc.gz"
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
       else
         partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
       fi
@@ -550,15 +554,15 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=1M status=none | pv | pigz -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=1M status=progress | pigz -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
       fi
     fi
             ); rc=$?
@@ -579,13 +583,13 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | pigz -1 > "${OUTBASE}.ntfs.gz"
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
       else
         ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pigz -1 > "${OUTBASE}.ntfs.gz"
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
       else
         ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
       fi
@@ -605,15 +609,15 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=1M status=none | pv | pigz -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=1M status=progress | pigz -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
       fi
     fi
             ); rc=$?
@@ -634,15 +638,15 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=1M status=none | pv | pigz -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=1M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=1M status=progress | pigz -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=1M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
       fi
     fi
           ); rc=$?
@@ -661,7 +665,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     diag "[ARCH] Packaging archive..."
     PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
     if command -v pigz >/dev/null 2>&1; then
-      (cd "$TMPDIR" && tar -I pigz -cf "$ARCH_TAR" .)
+      (cd "$TMPDIR" && tar -I "pigz $PIGZ_ARGS" -cf "$ARCH_TAR" .)
     else
       if command -v pv >/dev/null 2>&1 && [[ "$PKG_BYTES" =~ ^[0-9]+$ ]]; then
         (cd "$TMPDIR" && tar -cz . | pv -s "$PKG_BYTES" > "$ARCH_TAR")
@@ -705,8 +709,8 @@ else
   diag "[RESTORE] Extracting archive..."
   # Stream extraction directly via tar to avoid any pre-read overhead
   if command -v pigz >/dev/null 2>&1; then
-    # tar will automatically use pigz for .gz when specified via -I
-    if tar --no-same-owner -I pigz -x -f "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
+    # tar will use pigz with configured thread count via -I
+    if tar --no-same-owner -I "pigz $PIGZ_ARGS" -x -f "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
   else
     if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
   fi
