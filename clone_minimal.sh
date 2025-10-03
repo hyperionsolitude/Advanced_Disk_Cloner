@@ -7,7 +7,7 @@
 set -euo pipefail
 
 # Verbosity control: pass -v or --verbose to enable diagnostic logs
-VERBOSE=${VERBOSE:-no}
+VERBOSE=no
 for __arg in "$@"; do
   case "$__arg" in
     -v|--verbose) VERBOSE=yes ;;
@@ -15,51 +15,31 @@ for __arg in "$@"; do
 done
 diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
 
-# Performance tuning defaults
-THREADS=${THREADS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 2)}
-PIGZ_ARGS=${PIGZ_ARGS:--1 -p ${THREADS}}
+# Performance tuning defaults (auto-detected; no runtime params required)
+THREADS=$(command -v nproc >/dev/null 2>&1 && nproc || echo 2)
+PIGZ_ARGS="-1 -p ${THREADS}"
 HAS_ZSTD=no; command -v zstd >/dev/null 2>&1 && HAS_ZSTD=yes || true
 HAS_PIGZ=no; command -v pigz >/dev/null 2>&1 && HAS_PIGZ=yes || true
 
-# Compression strategy for tar and per-partition images
-# You may override with COMPRESSOR=zstd|pigz|gzip
-COMPRESSOR=${COMPRESSOR:-auto}
-if [ "$COMPRESSOR" = "zstd" ] && [ "$HAS_ZSTD" = "yes" ]; then
+# Compression strategy (auto): prefer pigz, then zstd, else gzip
+if [ "$HAS_PIGZ" = "yes" ]; then
+  TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
+  TAR_DECOMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
+  PART_EXT="gz"
+elif [ "$HAS_ZSTD" = "yes" ]; then
   TAR_COMP_FLAG=( -I "zstd -T${THREADS} -1" )
   TAR_DECOMP_FLAG=( -I "zstd -T${THREADS} -d" )
   PART_EXT="zst"
   PART_COMP_CMD_ZSTD="zstd -T${THREADS} -1"
   PART_DECOMP_CMD_ZSTD="zstd -T${THREADS} -d"
-elif [ "$COMPRESSOR" = "pigz" ] && [ "$HAS_PIGZ" = "yes" ]; then
-  TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
-  TAR_DECOMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
-  PART_EXT="gz"
 else
-  # auto
-  if [ "$HAS_PIGZ" = "yes" ]; then
-    TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
-    TAR_DECOMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
-    PART_EXT="gz"
-  elif [ "$HAS_ZSTD" = "yes" ]; then
-    TAR_COMP_FLAG=( -I "zstd -T${THREADS} -1" )
-    TAR_DECOMP_FLAG=( -I "zstd -T${THREADS} -d" )
-    PART_EXT="zst"
-    PART_COMP_CMD_ZSTD="zstd -T${THREADS} -1"
-    PART_DECOMP_CMD_ZSTD="zstd -T${THREADS} -d"
-  else
-    TAR_COMP_FLAG=()
-    TAR_DECOMP_FLAG=()
-    PART_EXT="gz"
-  fi
+  TAR_COMP_FLAG=()
+  TAR_DECOMP_FLAG=()
+  PART_EXT="gz"
 fi
 
-# Optional DIRECT I/O for dd (may help on some storage stacks)
-DIRECT_IO=${DIRECT_IO:-no}
+# Optional DIRECT I/O (auto: off by default)
 DD_IFLAGS=""; DD_OFLAGS=""
-if [ "$DIRECT_IO" = "yes" ]; then
-  DD_IFLAGS="iflag=direct"
-  DD_OFLAGS="oflag=direct"
-fi
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
