@@ -18,6 +18,48 @@ diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
 # Performance tuning defaults
 THREADS=${THREADS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 2)}
 PIGZ_ARGS=${PIGZ_ARGS:--1 -p ${THREADS}}
+HAS_ZSTD=no; command -v zstd >/dev/null 2>&1 && HAS_ZSTD=yes || true
+HAS_PIGZ=no; command -v pigz >/dev/null 2>&1 && HAS_PIGZ=yes || true
+
+# Compression strategy for tar and per-partition images
+# You may override with COMPRESSOR=zstd|pigz|gzip
+COMPRESSOR=${COMPRESSOR:-auto}
+if [ "$COMPRESSOR" = "zstd" ] && [ "$HAS_ZSTD" = "yes" ]; then
+  TAR_COMP_FLAG=( -I "zstd -T${THREADS} -1" )
+  TAR_DECOMP_FLAG=( -I "zstd -T${THREADS} -d" )
+  PART_EXT="zst"
+  PART_COMP_CMD_ZSTD="zstd -T${THREADS} -1"
+  PART_DECOMP_CMD_ZSTD="zstd -T${THREADS} -d"
+elif [ "$COMPRESSOR" = "pigz" ] && [ "$HAS_PIGZ" = "yes" ]; then
+  TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
+  TAR_DECOMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
+  PART_EXT="gz"
+else
+  # auto
+  if [ "$HAS_PIGZ" = "yes" ]; then
+    TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
+    TAR_DECOMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
+    PART_EXT="gz"
+  elif [ "$HAS_ZSTD" = "yes" ]; then
+    TAR_COMP_FLAG=( -I "zstd -T${THREADS} -1" )
+    TAR_DECOMP_FLAG=( -I "zstd -T${THREADS} -d" )
+    PART_EXT="zst"
+    PART_COMP_CMD_ZSTD="zstd -T${THREADS} -1"
+    PART_DECOMP_CMD_ZSTD="zstd -T${THREADS} -d"
+  else
+    TAR_COMP_FLAG=()
+    TAR_DECOMP_FLAG=()
+    PART_EXT="gz"
+  fi
+fi
+
+# Optional DIRECT I/O for dd (may help on some storage stacks)
+DIRECT_IO=${DIRECT_IO:-no}
+DD_IFLAGS=""; DD_OFLAGS=""
+if [ "$DIRECT_IO" = "yes" ]; then
+  DD_IFLAGS="iflag=direct"
+  DD_OFLAGS="oflag=direct"
+fi
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
@@ -478,9 +520,9 @@ else
 fi
 if [[ "$OP" =~ ^[Cc]$ ]]; then
   if command -v pv >/dev/null 2>&1; then
-    dd if="$SRC" bs=16M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | dd of="$DST" bs=16M conv=fsync
+    dd if="$SRC" bs=16M ${DD_IFLAGS:+$DD_IFLAGS} conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | dd of="$DST" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
   else
-    dd if="$SRC" of="$DST" bs=16M status=progress conv=noerror,sync,fsync
+    dd if="$SRC" of="$DST" bs=16M ${DD_IFLAGS:+$DD_IFLAGS} ${DD_OFLAGS:+$DD_OFLAGS} status=progress conv=noerror,sync,fsync
   fi
   sync
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
@@ -526,17 +568,25 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             echo -e "$PNAME\text4\tpartclone" >> "$MANIFEST"
             (
               set +e -o pipefail
-    if command -v pv >/dev/null 2>&1; then
-      if command -v pigz >/dev/null 2>&1; then
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+    if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+      if command -v pv >/dev/null 2>&1; then
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       else
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
+        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       fi
     else
-      if command -v pigz >/dev/null 2>&1; then
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+      if command -v pv >/dev/null 2>&1; then
+        if command -v pigz >/dev/null 2>&1; then
+          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+        else
+          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
+        fi
       else
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
+        if command -v pigz >/dev/null 2>&1; then
+          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+        else
+          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
+        fi
       fi
     fi
             ); rc=$?
@@ -581,17 +631,25 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             echo -e "$PNAME\tntfs\tntfsclone" >> "$MANIFEST"
             (
               set +e -o pipefail
-    if command -v pv >/dev/null 2>&1; then
-      if command -v pigz >/dev/null 2>&1; then
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
+    if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+      if command -v pv >/dev/null 2>&1; then
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
       else
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+        ntfsclone --save-image --output - "$DEV" 2>/dev/null | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
       fi
     else
-      if command -v pigz >/dev/null 2>&1; then
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
+      if command -v pv >/dev/null 2>&1; then
+        if command -v pigz >/dev/null 2>&1; then
+          ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
+        else
+          ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+        fi
       else
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
+        if command -v pigz >/dev/null 2>&1; then
+          ntfsclone --save-image --output - "$DEV" 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
+        else
+          ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
+        fi
       fi
     fi
             ); rc=$?
@@ -664,8 +722,8 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     # Package everything into a tarball (new-format archive) with progress
     diag "[ARCH] Packaging archive..."
     PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
-    if command -v pigz >/dev/null 2>&1; then
-      (cd "$TMPDIR" && tar -I "pigz $PIGZ_ARGS" -cf "$ARCH_TAR" .)
+    if [ ${#TAR_COMP_FLAG[@]} -gt 0 ]; then
+      (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" .)
     else
       if command -v pv >/dev/null 2>&1 && [[ "$PKG_BYTES" =~ ^[0-9]+$ ]]; then
         (cd "$TMPDIR" && tar -cz . | pv -s "$PKG_BYTES" > "$ARCH_TAR")
@@ -708,9 +766,8 @@ else
   fi
   diag "[RESTORE] Extracting archive..."
   # Stream extraction directly via tar to avoid any pre-read overhead
-  if command -v pigz >/dev/null 2>&1; then
-    # tar will use pigz with configured thread count via -I
-    if tar --no-same-owner -I "pigz $PIGZ_ARGS" -x -f "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
+  if [ ${#TAR_DECOMP_FLAG[@]} -gt 0 ]; then
+    if tar --no-same-owner "${TAR_DECOMP_FLAG[@]}" -x -f "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
   else
     if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
   fi
@@ -1028,26 +1085,42 @@ else
           BASE="$TMPDIR/part-${PNAME}"
           case "$TOOL" in
             partclone)
-              if [ -f "${BASE}.pc.gz" ] && command -v partclone.extfs >/dev/null 2>&1; then
+            if [ -f "${BASE}.pc.${PART_EXT}" ] && command -v partclone.extfs >/dev/null 2>&1; then
+              if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.extfs -r -o "$TDEV" -s -
+              else
                 gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+              fi
               else
                 echo "WARN: missing partclone image or tool for $PNAME"
               fi
               ;;
             ntfsclone)
-              if [ -f "${BASE}.ntfs.gz" ] && command -v ntfsclone >/dev/null 2>&1; then
+            if [ -f "${BASE}.ntfs.${PART_EXT}" ] && command -v ntfsclone >/dev/null 2>&1; then
+              if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                zstd -dc -T${THREADS} "${BASE}.ntfs.zst" | ntfsclone --restore-image --overwrite "$TDEV" -
+              else
                 gzip -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
+              fi
               else
                 echo "WARN: missing ntfsclone image or tool for $PNAME"
               fi
               ;;
             dd)
-              if [ -f "${BASE}.raw.gz" ]; then
-                if command -v pv >/dev/null 2>&1; then
-                  gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+            if [ -f "${BASE}.raw.${PART_EXT}" ]; then
+              if command -v pv >/dev/null 2>&1; then
+                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                  zstd -dc -T${THREADS} "${BASE}.raw.zst" | pv | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
                 else
-                  gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                  gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
                 fi
+              else
+                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                  zstd -dc -T${THREADS} "${BASE}.raw.zst" | dd of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
+                else
+                  gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
+                fi
+              fi
               else
                 echo "WARN: missing raw image for $PNAME"
               fi
