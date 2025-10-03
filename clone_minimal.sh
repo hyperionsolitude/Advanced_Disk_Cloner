@@ -730,6 +730,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     done
     # Package everything into a tarball (new-format archive) with progress
     diag "[ARCH] Packaging archive..."
+    echo "[ARCH] Packaging archive... (this may take a while)" >&2
     PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
     if [ ${#TAR_COMP_FLAG[@]} -gt 0 ]; then
       (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" .)
