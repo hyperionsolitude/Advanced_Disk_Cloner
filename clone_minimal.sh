@@ -41,6 +41,30 @@ fi
 # Optional DIRECT I/O (auto: off by default)
 DD_IFLAGS=""; DD_OFLAGS=""
 
+# Optional: raise I/O priority to best-effort high if ionice is present
+IONICE=""; if command -v ionice >/dev/null 2>&1; then IONICE="ionice -c2 -n0"; fi
+
+# Optional: increase readahead for block devices we touch; restored on exit
+ORIG_RA_FILE=""; ORIG_RA_DST=""; ORIG_RA_SRC="";
+set_readahead() {
+  local dev="$1" val="$2"
+  local ra_file="/sys/block/$(basename "$dev")/queue/read_ahead_kb"
+  if [ -w "$ra_file" ]; then
+    cat "$ra_file" 2>/dev/null || true
+    echo "$val" > "$ra_file" 2>/dev/null || true
+  fi
+}
+restore_readahead() {
+  [ -n "$ORIG_RA_SRC" ] && set_readahead "${SRC}" "$ORIG_RA_SRC"
+  [ -n "$ORIG_RA_DST" ] && [ -n "${DST:-}" ] && set_readahead "${DST}" "$ORIG_RA_DST"
+}
+trap 'restore_readahead' EXIT INT TERM HUP
+
+get_readahead() {
+  local dev="$1"; local ra_file="/sys/block/$(basename "$dev")/queue/read_ahead_kb"
+  if [ -r "$ra_file" ]; then cat "$ra_file" 2>/dev/null || true; fi
+}
+
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
 # Self-test mode: validate environment and exit
@@ -262,10 +286,15 @@ if [ -n "$SYS_DISK" ]; then
 fi
 
 echo "SOURCE: $SRC"
+# Bump readahead temporarily to 4096 KiB for throughput
+ORIG_RA_SRC=$(get_readahead "$SRC" || echo "")
+set_readahead "$SRC" 4096
 if [[ "$OP" =~ ^[Cc]$ ]]; then
   echo "TARGET: $DST (WILL BE ERASED)"
   read -rp "Type YES to confirm clone: " CONFIRM
   [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
+  ORIG_RA_DST=$(get_readahead "$DST" || echo "")
+  set_readahead "$DST" 4096
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
   # Choose destination drive (mounted) and path for archive
   SRC_BASENAME=$(basename "$SRC")
@@ -500,9 +529,9 @@ else
 fi
 if [[ "$OP" =~ ^[Cc]$ ]]; then
   if command -v pv >/dev/null 2>&1; then
-    dd if="$SRC" bs=16M ${DD_IFLAGS:+$DD_IFLAGS} conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | dd of="$DST" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
+    ${IONICE:+$IONICE }dd if="$SRC" bs=16M ${DD_IFLAGS:+$DD_IFLAGS} conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | ${IONICE:+$IONICE }dd of="$DST" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
   else
-    dd if="$SRC" of="$DST" bs=16M ${DD_IFLAGS:+$DD_IFLAGS} ${DD_OFLAGS:+$DD_OFLAGS} status=progress conv=noerror,sync,fsync
+    ${IONICE:+$IONICE }dd if="$SRC" of="$DST" bs=16M ${DD_IFLAGS:+$DD_IFLAGS} ${DD_OFLAGS:+$DD_OFLAGS} status=progress conv=noerror,sync,fsync
   fi
   sync
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
@@ -550,14 +579,14 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
       if command -v pv >/dev/null 2>&1; then
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
+        ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>/dev/null | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       else
         partclone.extfs -c -s "$DEV" -o - 2>/dev/null | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       fi
     else
       if command -v pv >/dev/null 2>&1; then
         if command -v pigz >/dev/null 2>&1; then
-          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+          ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>/dev/null | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
         else
           partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
         fi
@@ -584,7 +613,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=16M status=none | pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+        ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
         dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
       fi
@@ -613,14 +642,14 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
       if command -v pv >/dev/null 2>&1; then
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
+        ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" 2>/dev/null | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
       else
         ntfsclone --save-image --output - "$DEV" 2>/dev/null | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
       fi
     else
       if command -v pv >/dev/null 2>&1; then
         if command -v pigz >/dev/null 2>&1; then
-          ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
+          ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" 2>/dev/null | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
         else
           ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
         fi
@@ -647,7 +676,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=16M status=none | pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+        ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
         dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
       fi
@@ -676,7 +705,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
       if command -v pigz >/dev/null 2>&1; then
-        dd if="$DEV" bs=16M status=none | pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+        ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
         dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
       fi
@@ -706,7 +735,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" .)
     else
       if command -v pv >/dev/null 2>&1 && [[ "$PKG_BYTES" =~ ^[0-9]+$ ]]; then
-        (cd "$TMPDIR" && tar -cz . | pv -s "$PKG_BYTES" > "$ARCH_TAR")
+        (cd "$TMPDIR" && tar -cz . | ${IONICE:+$IONICE }pv -s "$PKG_BYTES" > "$ARCH_TAR")
       else
         (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
       fi
@@ -720,10 +749,10 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     # Legacy full-disk raw archive
     sfdisk -d "$SRC" > "${ARCH%.gz}.sfdisk" 2>/dev/null || true
     if command -v pigz >/dev/null 2>&1; then
-      dd if="$SRC" bs=1M conv=noerror,sync | pigz -1 > "$ARCH"
+      ${IONICE:+$IONICE }dd if="$SRC" bs=1M conv=noerror,sync | pigz -1 > "$ARCH"
     else
       if command -v pv >/dev/null 2>&1; then
-        dd if="$SRC" bs=1M conv=noerror,sync | pv -s "$(blockdev --getsize64 "$SRC")" | gzip -1 > "$ARCH"
+        ${IONICE:+$IONICE }dd if="$SRC" bs=1M conv=noerror,sync | ${IONICE:+$IONICE }pv -s "$(blockdev --getsize64 "$SRC")" | gzip -1 > "$ARCH"
       else
         dd if="$SRC" bs=1M status=progress conv=noerror,sync | gzip -1 > "$ARCH"
       fi
