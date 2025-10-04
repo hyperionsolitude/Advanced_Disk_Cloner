@@ -579,27 +579,27 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
       if command -v pv >/dev/null 2>&1; then
-        ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>/dev/null | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
+        ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       else
-        partclone.extfs -c -s "$DEV" -o - 2>/dev/null | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
+        partclone.extfs -c -s "$DEV" -o - | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       fi
     else
       if command -v pv >/dev/null 2>&1; then
         if command -v pigz >/dev/null 2>&1; then
-          ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>/dev/null | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+          ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
         else
-          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pv | gzip -1 > "${OUTBASE}.pc.gz"
+          partclone.extfs -c -s "$DEV" -o - | pv | gzip -1 > "${OUTBASE}.pc.gz"
         fi
       else
         if command -v pigz >/dev/null 2>&1; then
-          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+          partclone.extfs -c -s "$DEV" -o - | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
         else
-          partclone.extfs -c -s "$DEV" -o - 2>/dev/null | gzip -1 > "${OUTBASE}.pc.gz"
+          partclone.extfs -c -s "$DEV" -o - | gzip -1 > "${OUTBASE}.pc.gz"
         fi
       fi
     fi
             ); rc=$?
-            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.pc.gz" ]; then
+            if [ $rc -eq 0 ] && [ -s "${OUTBASE}.pc.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.pc.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tpartclone\tOK\t$sz" >> "$STATUS_LOG"
               diag "[ARCH] Done: $PNAME via partclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
@@ -625,7 +625,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       fi
     fi
             ); rc=$?
-            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
+            if [ $rc -eq 0 ] && [ -s "${OUTBASE}.raw.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
               diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
@@ -642,27 +642,27 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
       if command -v pv >/dev/null 2>&1; then
-        ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" 2>/dev/null | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
+        ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
       else
-        ntfsclone --save-image --output - "$DEV" 2>/dev/null | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
+        ntfsclone --save-image --output - "$DEV" | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
       fi
     else
       if command -v pv >/dev/null 2>&1; then
         if command -v pigz >/dev/null 2>&1; then
-          ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" 2>/dev/null | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
+          ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
         else
-          ntfsclone --save-image --output - "$DEV" 2>/dev/null | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+          ntfsclone --save-image --output - "$DEV" | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
         fi
       else
         if command -v pigz >/dev/null 2>&1; then
-          ntfsclone --save-image --output - "$DEV" 2>/dev/null | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
+          ntfsclone --save-image --output - "$DEV" | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
         else
-          ntfsclone --save-image --output - "$DEV" 2>/dev/null | gzip -1 > "${OUTBASE}.ntfs.gz"
+          ntfsclone --save-image --output - "$DEV" | gzip -1 > "${OUTBASE}.ntfs.gz"
         fi
       fi
     fi
             ); rc=$?
-            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.ntfs.gz" ]; then
+            if [ $rc -eq 0 ] && [ -s "${OUTBASE}.ntfs.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.ntfs.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tntfsclone\tOK\t$sz" >> "$STATUS_LOG"
               diag "[ARCH] Done: $PNAME via ntfsclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
@@ -688,7 +688,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       fi
     fi
             ); rc=$?
-            if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
+            if [ $rc -eq 0 ] && [ -s "${OUTBASE}.raw.gz" ]; then
               sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
               echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
               diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
@@ -717,7 +717,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       fi
     fi
           ); rc=$?
-          if [ $rc -eq 0 ] && [ -f "${OUTBASE}.raw.gz" ]; then
+          if [ $rc -eq 0 ] && [ -s "${OUTBASE}.raw.gz" ]; then
             sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
             echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
             diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
