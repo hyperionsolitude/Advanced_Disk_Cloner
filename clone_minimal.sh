@@ -1069,7 +1069,6 @@ else
       partprobe "$DST" || true
       sync
     fi
-    # Map target partitions list
     # Map target partitions list (kept for potential future diagnostics)
     mapfile -t _TPARTS_UNUSED < <(lsblk -ln -o NAME,PKNAME "$DST" | awk '$2=="" {next} $2!="" {print $1}')
     # If partial restore, collect selection from user
@@ -1430,8 +1429,6 @@ else
   echo "Saved archive: $ARCH"
   echo "Partition table dump: ${ARCH%.gz}.sfdisk (if available)"
 fi
-
-## Source re-grow feature removed
 
 echo "=== Done ==="
 show_op_time
