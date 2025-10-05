@@ -38,25 +38,31 @@ quiet_stderr() { if [ "$VERBOSE" = "no" ]; then "$@" 2>/dev/null; else "$@"; fi 
 
 # Performance tuning defaults (auto-detected; no runtime params required)
 THREADS=$(command -v nproc >/dev/null 2>&1 && nproc || echo 2)
-PIGZ_ARGS="-1 -p ${THREADS}"
 HAS_ZSTD=no; command -v zstd >/dev/null 2>&1 && HAS_ZSTD=yes || true
 HAS_PIGZ=no; command -v pigz >/dev/null 2>&1 && HAS_PIGZ=yes || true
 
-# Compression strategy (auto): prefer pigz, then zstd, else gzip
-if [ "$HAS_PIGZ" = "yes" ]; then
-  TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
-  TAR_DECOMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
-  PART_EXT="gz"
-elif [ "$HAS_ZSTD" = "yes" ]; then
-  TAR_COMP_FLAG=( -I "zstd -T${THREADS} -1" )
+# Compression strategy (optimized): prefer zstd (better ratio/speed), fallback to pigz, then gzip
+if [ "$HAS_ZSTD" = "yes" ]; then
+  # zstd -3: 10-15% better compression than -1, minimal speed loss on modern CPUs
+  PIGZ_ARGS=""  # Not used with zstd
+  TAR_COMP_FLAG=( -I "zstd -T${THREADS} -3" )
   TAR_DECOMP_FLAG=( -I "zstd -T${THREADS} -d" )
   PART_EXT="zst"
-  PART_COMP_CMD_ZSTD="zstd -T${THREADS} -1"
+  PART_COMP_CMD_ZSTD="zstd -T${THREADS} -3"
   PART_DECOMP_CMD_ZSTD="zstd -T${THREADS} -d"
+elif [ "$HAS_PIGZ" = "yes" ]; then
+  # pigz -3 --rsyncable: better compression + rsync-friendly blocks
+  PIGZ_ARGS="-3 --rsyncable -p ${THREADS}"
+  TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
+  TAR_DECOMP_FLAG=( -I "pigz -d -p ${THREADS}" )
+  PART_EXT="gz"
 else
+  # gzip -3: better than -1, still reasonably fast
+  PIGZ_ARGS=""
   TAR_COMP_FLAG=()
   TAR_DECOMP_FLAG=()
   PART_EXT="gz"
+  GZIP="-3"  # Environment variable for tar -z
 fi
 
 # Optional DIRECT I/O (auto: off by default)
@@ -641,22 +647,22 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
       if command -v pv >/dev/null 2>&1; then
-        { ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
+        { ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -3 > "${OUTBASE}.pc.zst"
       else
-        { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
+        { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | zstd -T${THREADS} -3 > "${OUTBASE}.pc.zst"
       fi
     else
       if command -v pv >/dev/null 2>&1; then
         if command -v pigz >/dev/null 2>&1; then
           { ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
         else
-          { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | pv | gzip -1 > "${OUTBASE}.pc.gz"
+          { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | pv | gzip -3 > "${OUTBASE}.pc.gz"
         fi
       else
         if command -v pigz >/dev/null 2>&1; then
           { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
         else
-          { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | gzip -1 > "${OUTBASE}.pc.gz"
+          { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | gzip -3 > "${OUTBASE}.pc.gz"
         fi
       fi
     fi
@@ -677,13 +683,13 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       if command -v pigz >/dev/null 2>&1; then
         ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | gzip -3 > "${OUTBASE}.raw.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
         dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=16M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | gzip -3 > "${OUTBASE}.raw.gz"
       fi
     fi
             ); rc=$?
@@ -704,22 +710,22 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
       if command -v pv >/dev/null 2>&1; then
-        ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
+        ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -3 > "${OUTBASE}.ntfs.zst"
       else
-        ntfsclone --save-image --output - "$DEV" | zstd -T${THREADS} -1 > "${OUTBASE}.ntfs.zst"
+        ntfsclone --save-image --output - "$DEV" | zstd -T${THREADS} -3 > "${OUTBASE}.ntfs.zst"
       fi
     else
       if command -v pv >/dev/null 2>&1; then
         if command -v pigz >/dev/null 2>&1; then
           ${IONICE:+$IONICE }ntfsclone --save-image --output - "$DEV" | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
         else
-          ntfsclone --save-image --output - "$DEV" | pv | gzip -1 > "${OUTBASE}.ntfs.gz"
+          ntfsclone --save-image --output - "$DEV" | pv | gzip -3 > "${OUTBASE}.ntfs.gz"
         fi
       else
         if command -v pigz >/dev/null 2>&1; then
           ntfsclone --save-image --output - "$DEV" | pigz $PIGZ_ARGS > "${OUTBASE}.ntfs.gz"
         else
-          ntfsclone --save-image --output - "$DEV" | gzip -1 > "${OUTBASE}.ntfs.gz"
+          ntfsclone --save-image --output - "$DEV" | gzip -3 > "${OUTBASE}.ntfs.gz"
         fi
       fi
     fi
@@ -740,13 +746,13 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       if command -v pigz >/dev/null 2>&1; then
         ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | gzip -3 > "${OUTBASE}.raw.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
         dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=16M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | gzip -3 > "${OUTBASE}.raw.gz"
       fi
     fi
             ); rc=$?
@@ -769,13 +775,13 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       if command -v pigz >/dev/null 2>&1; then
         ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=16M status=none | pv | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=none | pv | gzip -3 > "${OUTBASE}.raw.gz"
       fi
     else
       if command -v pigz >/dev/null 2>&1; then
         dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
       else
-        dd if="$DEV" bs=16M status=progress | gzip -1 > "${OUTBASE}.raw.gz"
+        dd if="$DEV" bs=16M status=progress | gzip -3 > "${OUTBASE}.raw.gz"
       fi
     fi
           ); rc=$?
@@ -815,9 +821,9 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       ${IONICE:+$IONICE }dd if="$SRC" bs=1M conv=noerror,sync | pigz -1 > "$ARCH"
     else
       if command -v pv >/dev/null 2>&1; then
-        ${IONICE:+$IONICE }dd if="$SRC" bs=1M conv=noerror,sync | ${IONICE:+$IONICE }pv -s "$(blockdev --getsize64 "$SRC")" | gzip -1 > "$ARCH"
+        ${IONICE:+$IONICE }dd if="$SRC" bs=1M conv=noerror,sync | ${IONICE:+$IONICE }pv -s "$(blockdev --getsize64 "$SRC")" | gzip -3 > "$ARCH"
       else
-        dd if="$SRC" bs=1M status=progress conv=noerror,sync | gzip -1 > "$ARCH"
+        dd if="$SRC" bs=1M status=progress conv=noerror,sync | gzip -3 > "$ARCH"
       fi
     fi
     sync
