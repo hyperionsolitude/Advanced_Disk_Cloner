@@ -319,11 +319,13 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     if [ "$DSTSAVE_IDX" -lt 0 ] || [ "$DSTSAVE_IDX" -ge ${#MOUNTED[@]} ]; then echo "ERROR: selection out of range"; exit 1; fi
     ARCH_DIR=$(echo "${MOUNTED[$DSTSAVE_IDX]}" | awk '{print $2}')
   else
-    read -rp "Enter a directory path to save the archive (must exist): " ARCH_DIR
+    # Enable readline so TAB completes filesystem paths
+    read -e -p "Enter a directory path to save the archive (must exist): " ARCH_DIR
   fi
   [ -d "$ARCH_DIR" ] || { echo "Archive directory does not exist: $ARCH_DIR"; exit 1; }
   # Ask for file name or a path within the chosen destination (absolute path also accepted)
-  read -rp "Enter archive file name or path [default ${SRC_BASENAME}.img.gz]: " ARCH_INPUT
+  # Enable readline with filename completion and an inline default
+  read -e -p "Enter archive file name or path [default ${SRC_BASENAME}.img.gz]: " -i "${SRC_BASENAME}.img.gz" ARCH_INPUT
   ARCH_INPUT=${ARCH_INPUT:-${SRC_BASENAME}.img.gz}
   # Determine full path: absolute provided → use as-is; otherwise place under chosen directory
   if [[ "$ARCH_INPUT" = /* ]]; then
@@ -362,7 +364,28 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   if [ -e "$ARCH" ]; then read -rp "File exists at $ARCH. Overwrite? (y/N): " OW; [[ "$OW" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }; fi
 elif [[ "$OP" =~ ^[Rr]$ ]]; then
   # Restore from image to selected target disk
-  read -rp "Enter archive image file to restore (e.g., ./sdb.img.gz): " ARCH
+  # Compute a sensible default base for TAB completion: if SOURCE has a mounted partition,
+  # prefill the prompt with that mountpoint so TAB lists files from there.
+  SRC_BN=$(basename -- "$SRC")
+  SRC_BASE_MP=$(lsblk -ln -o NAME,MOUNTPOINT,PKNAME "$SRC" | awk '$2!="" {print $2; exit}')
+  DEF_BASE="./"
+  if [ -n "$SRC_BASE_MP" ]; then DEF_BASE="${SRC_BASE_MP%/}/"; fi
+  read -e -i "$DEF_BASE" -p "Enter archive image file to restore (e.g., ./sdb.img.gz): " ARCH
+  # If user provided a relative path like ./ or ./file, resolve relative to the SOURCE's mounted partition (if any)
+  if [ -n "$SRC_BASE_MP" ]; then
+    if [ "$ARCH" = "./" ] || [ "$ARCH" = "." ]; then
+      ARCH="${SRC_BASE_MP%/}/"
+    elif [[ "$ARCH" != /* ]]; then
+      # Relative path => anchor to the source disk's mountpoint
+      ARCH="${SRC_BASE_MP%/}/${ARCH#./}"
+    fi
+  fi
+  # If a directory is provided, allow selecting a file within it (TAB completes)
+  while [ -d "$ARCH" ]; do
+    # Show a hint once
+    echo "Enter a file inside: $ARCH"
+    read -e -p "Archive file within directory: " -i "${ARCH%/}/" ARCH
+  done
   if [ ! -f "$ARCH" ]; then
     # If a relative path was provided, try resolving against mounted real-disk destinations
     # Collect mounted destinations where TYPE=part, parent PKNAME is sdX or nvme*n1
@@ -812,7 +835,7 @@ else
           echo "[RESTORE][DIAG] Compact mode enabled"
           echo "[RESTORE][DIAG] Target: $DST  sector_size=$SECTOR_SIZE  disk_sectors=$DISK_SECTORS"
         } >&2
-        # Parse original dump to collect partition sizes and types by index
+        # Parse original dump to collect partition sizes, types and UUIDs by index
         # Lines look like: /dev/nvme0n1p3 : start=     123, size=   456, type=...
         # Do not depend on current SRC name; match any /dev/* partition lines
         mapfile -t DUMP_LINES < <(grep -E "^/dev/[^[:space:]]*[0-9]+[[:space:]]*:" "$TMPDIR/partition_table.sfdisk" || true)
@@ -824,24 +847,27 @@ else
           } >&2
           sfdisk "$DST" < "$TMPDIR/partition_table.sfdisk"
         else
-          # Build arrays: IDX -> TYPE, SIZE_SECT
+          # Build arrays: IDX -> TYPE, SIZE_SECT, UUID
           PART_INDEXES=()
           declare -A TYPE_BY_IDX
           declare -A SIZE_BY_IDX
+          declare -A UUID_BY_IDX
           for ln in "${DUMP_LINES[@]}"; do
             # Extract trailing digits before the first ':' (partition index)
             idx=$(printf '%s' "$ln" | sed -E 's/^.*[^0-9]([0-9]+)[[:space:]]*:.*/\1/' | tail -n1)
             type=$(printf '%s' "$ln" | awk -F'type=' 'NF>1{print $2}' | awk -F',' '{print $1}' | sed 's/[[:space:]]//g')
             size=$(printf '%s' "$ln" | awk -F'size=' 'NF>1{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+            uuid=$(printf '%s' "$ln" | awk -F'uuid=' 'NF>1{print $2}' | awk -F',' '{print $1}' | sed 's/[[:space:]]//g')
             if [[ "$idx" =~ ^[0-9]+$ ]] && [[ "$size" =~ ^[0-9]+$ ]]; then
               PART_INDEXES+=("$idx")
               TYPE_BY_IDX[$idx]="$type"
               SIZE_BY_IDX[$idx]="$size"
+              if [ -n "$uuid" ]; then UUID_BY_IDX[$idx]="$uuid"; fi
             fi
           done
           if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG] Parsed partitions from dump (index:type:size_sectors):" >&2; fi
           for i in "${PART_INDEXES[@]}"; do
-            if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG]  $i:${TYPE_BY_IDX[$i]:-?}:${SIZE_BY_IDX[$i]:-?}" >&2; fi
+            if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG]  $i:${TYPE_BY_IDX[$i]:-?}:${SIZE_BY_IDX[$i]:-?}:${UUID_BY_IDX[$i]:-}" >&2; fi
           done
           # Discover filesystems to allow enlargement prompts (ext4/ntfs only)
           declare -A FS_BY_IDX
@@ -898,11 +924,20 @@ else
             echo "unit: sectors"
             for i in "${PART_INDEXES[@]}"; do
               t="${TYPE_BY_IDX[$i]}"; s="${SIZE_NEW[$i]}"
+              u="${UUID_BY_IDX[$i]:-}"
               # sfdisk line: <dev>p<i> : size=<s>, type=<t>
               if [[ "$DST" =~ nvme[0-9]+n[0-9]+$ ]]; then
-                echo "${DST}p${i} : size=${s}${t:+, type=$t}"
+                if [ -n "$u" ]; then
+                  echo "${DST}p${i} : size=${s}${t:+, type=$t}, uuid=$u"
+                else
+                  echo "${DST}p${i} : size=${s}${t:+, type=$t}"
+                fi
               else
-                echo "${DST}${i} : size=${s}${t:+, type=$t}"
+                if [ -n "$u" ]; then
+                  echo "${DST}${i} : size=${s}${t:+, type=$t}, uuid=$u"
+                else
+                  echo "${DST}${i} : size=${s}${t:+, type=$t}"
+                fi
               fi
             done
           } > "$NEWTAB"
@@ -915,6 +950,20 @@ else
             } >&2
           fi
           rm -f "$NEWTAB"
+          # After table write, explicitly set partition GUIDs using sgdisk to ensure preservation
+          if command -v sgdisk >/dev/null 2>&1; then
+            for i in "${PART_INDEXES[@]}"; do
+              u="${UUID_BY_IDX[$i]:-}"
+              if [ -n "$u" ]; then
+                sgdisk -u="${i}:${u}" "$DST" >/dev/null 2>&1 || true
+              fi
+            done
+            # Also set disk GUID to match original label-id from dump (safe when only clone is connected)
+            ORIG_DISK_GUID=$(awk -F': ' '/^label-id:/ {print $2}' "$TMPDIR/partition_table.sfdisk" | tr 'a-f' 'A-F' | tr -d '\r')
+            if [[ "$ORIG_DISK_GUID" =~ ^[0-9A-F-]+$ ]]; then
+              sgdisk -U "$ORIG_DISK_GUID" "$DST" >/dev/null 2>&1 || true
+            fi
+          fi
         fi
       else
         {
@@ -927,6 +976,13 @@ else
             echo "[RESTORE][DIAG][ERROR] sfdisk failed with code $SF_RC" >&2
             echo "[RESTORE][DIAG][ERROR] sfdisk output:" >&2; echo "$SF_OUT" >&2
           } >&2
+        fi
+        # After importing table, also set disk GUID from label-id to ensure match with source
+        if command -v sgdisk >/dev/null 2>&1; then
+          ORIG_DISK_GUID=$(awk -F': ' '/^label-id:/ {print $2}' "$TMPDIR/partition_table.sfdisk" | tr 'a-f' 'A-F' | tr -d '\r')
+          if [[ "$ORIG_DISK_GUID" =~ ^[0-9A-F-]+$ ]]; then
+            sgdisk -U "$ORIG_DISK_GUID" "$DST" >/dev/null 2>&1 || true
+          fi
         fi
       fi
       partprobe "$DST" || true
@@ -1165,7 +1221,22 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
   # Offer to randomize GPT disk and partition GUIDs on target to avoid conflicts
   if [ "${PARTIAL_RESTORE:-no}" != "yes" ]; then
     if command -v sgdisk >/dev/null 2>&1; then
-      RAND_GUIDS=$(read_yes_no "Randomize GPT disk and partition GUIDs on TARGET to avoid conflicts with SOURCE? (y/N): ")
+      # Heuristic: detect a Windows installation on the target; if present, advise against GUID randomization
+      has_windows=no
+      mapfile -t _NTFS_TGT < <(lsblk -ln -o NAME,FSTYPE "$DST" | awk '$2=="ntfs"{print $1}')
+      for _p in "${_NTFS_TGT[@]}"; do
+        _dev="/dev/${_p}"
+        _mp=$(mktemp -d)
+        if mount -o ro "${_dev}" "${_mp}" 2>/dev/null; then
+          if [ -d "${_mp}/Windows/System32" ]; then has_windows=yes; fi
+          umount "${_mp}" 2>/dev/null || true
+        fi
+        rmdir "${_mp}" 2>/dev/null || true
+      done
+      if [ "$has_windows" = "yes" ]; then
+        echo "Detected Windows files on target. Skipping GUID randomization is recommended to keep BCD valid."
+      fi
+      RAND_GUIDS=$(read_yes_no "Randomize GPT disk and partition GUIDs on TARGET? (y/N): ")
       if [[ "$RAND_GUIDS" =~ ^[Yy]$ ]]; then
         echo "Randomizing disk GUID on $DST..."
         sgdisk -G "$DST" || true
