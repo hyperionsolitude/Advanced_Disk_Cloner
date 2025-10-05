@@ -1,8 +1,43 @@
 #!/bin/bash
 
-# Minimal disk cloner
-# - Lets user choose SOURCE and TARGET devices
-# - Clones disk → disk with dd + GPT backup fix (sgdisk -e)
+# Advanced Disk Cloner (Minimal)
+#
+# Purpose:
+#   Single-file, menu-driven disk cloner/archiver/restorer designed to work from live Linux.
+#   Focuses on safety, speed, and Windows/Linux compatibility.
+#
+# Key Features:
+#   - Interactive disk selection for SOURCE and TARGET (supports sdX and nvme*n1)
+#   - Clone disk → disk with dd and GPT backup repair (sgdisk -e)
+#   - Archive disk → used-block per-partition images (partclone/ntfsclone) packed in tar
+#     • Falls back to raw dd for unsupported or mounted filesystems
+#     • Saves partition table dump (sfdisk) and a manifest
+#   - Restore from archive → recreates GPT and restores per partition
+#     • Compact restore option (pack partitions contiguously)
+#     • Preserves original PARTUUIDs and disk GUID (label-id) for Windows boot stability
+#     • Optional enlargement of last partition and ext4/NTFS grow
+#   - Partial restore → restore selected partitions only (does not alter partition table)
+#   - GUID management → can randomize GUIDs when both original and clone will coexist
+#   - Clean output → progress bars, concise status, total runtime (non-verbose)
+#   - Path UX → TAB completion and mountpoint-anchored prompts (archive/restore)
+#   - Auto-install (Ubuntu) of required tools; diagnostics and self-test mode
+#
+# Performance:
+#   - Multi-threaded compression/decompression (pigz/zstd) using all CPU cores
+#   - zstd -3 preferred for strong ratio with minimal speed cost; pigz --rsyncable fallback
+#   - Ionice and readahead tuning for smoother I/O
+#
+# Safety Notes:
+#   - When restoring/cloning Windows: for a standalone clone (original not attached), GUIDs are preserved
+#     to keep BCD references valid. If both disks will be attached simultaneously, randomize GUIDs and
+#     rebuild BCD (outside the scope of this Linux-only script) or ensure separate EFI entries.
+#   - Partial restore will not touch the GPT; ensure target partitions are correctly sized and unmounted.
+#
+# Usage:
+#   sudo ./clone_minimal.sh [-v|--verbose]
+#
+# License: MIT
+#
 
 set -euo pipefail
 
