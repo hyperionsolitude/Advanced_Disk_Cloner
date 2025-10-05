@@ -15,6 +15,27 @@ for __arg in "$@"; do
 done
 diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
 
+# Timer functions for operation tracking (excludes user interaction time)
+OP_START_TIME=""
+start_op_timer() { OP_START_TIME=$(date +%s); }
+show_op_time() {
+  if [ -n "$OP_START_TIME" ]; then
+    local end=$(date +%s)
+    local elapsed=$((end - OP_START_TIME))
+    local h=$((elapsed / 3600))
+    local m=$(((elapsed % 3600) / 60))
+    local s=$((elapsed % 60))
+    printf "Total operation time: "
+    [ $h -gt 0 ] && printf "%dh " $h
+    [ $m -gt 0 ] && printf "%dm " $m
+    printf "%ds\n" $s
+  fi
+}
+
+# Clean output helpers (non-verbose)
+progress_msg() { [ "$VERBOSE" = "no" ] && echo "$@" || true; }
+quiet_stderr() { if [ "$VERBOSE" = "no" ]; then "$@" 2>/dev/null; else "$@"; fi }
+
 # Performance tuning defaults (auto-detected; no runtime params required)
 THREADS=$(command -v nproc >/dev/null 2>&1 && nproc || echo 2)
 PIGZ_ARGS="-1 -p ${THREADS}"
@@ -324,9 +345,19 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   fi
   [ -d "$ARCH_DIR" ] || { echo "Archive directory does not exist: $ARCH_DIR"; exit 1; }
   # Ask for file name or a path within the chosen destination (absolute path also accepted)
-  # Enable readline with filename completion and an inline default
-  read -e -p "Enter archive file name or path [default ${SRC_BASENAME}.img.gz]: " -i "${SRC_BASENAME}.img.gz" ARCH_INPUT
-  ARCH_INPUT=${ARCH_INPUT:-${SRC_BASENAME}.img.gz}
+  # Enable readline with filename completion and prefill with chosen destination directory
+  DEF_ARCH_PATH="${ARCH_DIR%/}/${SRC_BASENAME}.img.gz"
+  read -e -p "Enter archive file name or path [default ${SRC_BASENAME}.img.gz]: " -i "$DEF_ARCH_PATH" ARCH_INPUT
+  ARCH_INPUT=${ARCH_INPUT:-$DEF_ARCH_PATH}
+  # If user provided a relative path like ./ or ./file, resolve relative to the chosen destination directory
+  if [ -n "$ARCH_DIR" ]; then
+    if [ "$ARCH_INPUT" = "./" ] || [ "$ARCH_INPUT" = "." ]; then
+      ARCH_INPUT="${ARCH_DIR%/}/"
+    elif [[ "$ARCH_INPUT" != /* ]]; then
+      # Relative path => anchor to the chosen destination directory
+      ARCH_INPUT="${ARCH_DIR%/}/${ARCH_INPUT#./}"
+    fi
+  fi
   # Determine full path: absolute provided → use as-is; otherwise place under chosen directory
   if [[ "$ARCH_INPUT" = /* ]]; then
     ARCH="$ARCH_INPUT"
@@ -530,6 +561,9 @@ fi
 PROCEED_EST=$(read_yes_no "Proceed with operation given the estimates above? (y/N): ")
 [[ "$PROCEED_EST" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
 
+# Start operation timer (excludes user interaction time)
+start_op_timer
+
 if [[ "$OP" =~ ^[Cc]$ ]]; then
   echo "=== Start clone: $SRC → $DST ==="
 else
@@ -586,12 +620,17 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     sfdisk -d "$SRC" > "$TMPDIR/partition_table.sfdisk" 2>/dev/null || true
     # Enumerate partitions on source disk
     mapfile -t APARTS < <(lsblk -ln -o NAME,FSTYPE,SIZE,PARTLABEL,PARTUUID,PKNAME "$SRC" | awk 'NR>1 {print $1"\t"$2"\t"$3"\t"$4"\t"$5}')
+    PART_NUM=0
+    PART_TOTAL=${#APARTS[@]}
     for line in "${APARTS[@]}"; do
       PNAME=$(echo -e "$line" | awk -F"\t" '{print $1}')
       FST=$(echo -e   "$line" | awk -F"\t" '{print $2}')
+      PSIZE=$(echo -e  "$line" | awk -F"\t" '{print $3}')
       DEV="/dev/$PNAME"
       OUTBASE="$TMPDIR/part-${PNAME}"
+      PART_NUM=$((PART_NUM + 1))
       diag "[ARCH] Start: $PNAME (fs=${FST:-unknown})"
+      progress_msg "[$PART_NUM/$PART_TOTAL] Archiving $PNAME (${FST:-unknown}, $PSIZE)..."
       case "$FST" in
         ext4)
           # If partition is mounted (e.g., root), avoid partclone and fallback to dd
@@ -602,22 +641,22 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               set +e -o pipefail
     if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
       if command -v pv >/dev/null 2>&1; then
-        ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
+        { ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       else
-        partclone.extfs -c -s "$DEV" -o - | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
+        { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | zstd -T${THREADS} -1 > "${OUTBASE}.pc.zst"
       fi
     else
       if command -v pv >/dev/null 2>&1; then
         if command -v pigz >/dev/null 2>&1; then
-          ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+          { ${IONICE:+$IONICE }partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
         else
-          partclone.extfs -c -s "$DEV" -o - | pv | gzip -1 > "${OUTBASE}.pc.gz"
+          { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | pv | gzip -1 > "${OUTBASE}.pc.gz"
         fi
       else
         if command -v pigz >/dev/null 2>&1; then
-          partclone.extfs -c -s "$DEV" -o - | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+          { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
         else
-          partclone.extfs -c -s "$DEV" -o - | gzip -1 > "${OUTBASE}.pc.gz"
+          { partclone.extfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | gzip -1 > "${OUTBASE}.pc.gz"
         fi
       fi
     fi
@@ -753,7 +792,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     done
     # Package everything into a tarball (new-format archive) with progress
     diag "[ARCH] Packaging archive..."
-    echo "[ARCH] Packaging archive... (this may take a while)" >&2
+    progress_msg "Packaging archive..."
     PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
     if [ ${#TAR_COMP_FLAG[@]} -gt 0 ]; then
       (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" .)
@@ -798,11 +837,12 @@ else
     diag "[RESTORE] Using temp workspace: $TMPDIR"
   fi
   diag "[RESTORE] Extracting archive..."
+  progress_msg "Extracting archive..."
   # Stream extraction directly via tar to avoid any pre-read overhead
   if [ ${#TAR_DECOMP_FLAG[@]} -gt 0 ]; then
-    if tar --no-same-owner "${TAR_DECOMP_FLAG[@]}" -x -f "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
+    if tar --no-same-owner "${TAR_DECOMP_FLAG[@]}" -x -f "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then ARCH_IS_TAR=yes; fi
   else
-    if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR"; then ARCH_IS_TAR=yes; fi
+    if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then ARCH_IS_TAR=yes; fi
   fi
   if [ "$ARCH_IS_TAR" = "yes" ]; then
     cleanup_tmp() {
@@ -1353,6 +1393,7 @@ fi
 ## Source re-grow feature removed
 
 echo "=== Done ==="
+show_op_time
 if [[ "$OP" =~ ^[Cc]$ ]]; then
   echo "Cloned $SRC to $DST. If the target is larger, you may later expand partitions/filesystems."
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
