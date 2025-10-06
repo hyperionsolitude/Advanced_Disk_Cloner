@@ -702,10 +702,17 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       fi
     fi
             ); rc=$?
-            if [ $rc -eq 0 ] && [ -s "${OUTBASE}.pc.gz" ]; then
-              sz=$(stat -c %s "${OUTBASE}.pc.gz" 2>/dev/null || echo 0)
-              echo -e "$PNAME\tpartclone\tOK\t$sz" >> "$STATUS_LOG"
-              diag "[ARCH] Done: $PNAME via partclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+            if [ $rc -eq 0 ]; then
+              if   [ -s "${OUTBASE}.pc.zst" ]; then OUTFILE="${OUTBASE}.pc.zst";
+              elif [ -s "${OUTBASE}.pc.gz"  ]; then OUTFILE="${OUTBASE}.pc.gz"; else OUTFILE=""; fi
+              if [ -n "$OUTFILE" ]; then
+                sz=$(stat -c %s "$OUTFILE" 2>/dev/null || echo 0)
+                echo -e "$PNAME\tpartclone\tOK\t$sz" >> "$STATUS_LOG"
+                diag "[ARCH] Done: $PNAME via partclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+              else
+                echo -e "$PNAME\tpartclone\tFAIL\t0" >> "$STATUS_LOG"
+                echo "[ARCH] FAIL: $PNAME via partclone (no output detected)" >&2
+              fi
             else
               echo -e "$PNAME\tpartclone\tFAIL\t0" >> "$STATUS_LOG"
               echo "[ARCH] FAIL: $PNAME via partclone (rc=$rc)" >&2
@@ -765,10 +772,17 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       fi
     fi
             ); rc=$?
-            if [ $rc -eq 0 ] && [ -s "${OUTBASE}.ntfs.gz" ]; then
-              sz=$(stat -c %s "${OUTBASE}.ntfs.gz" 2>/dev/null || echo 0)
-              echo -e "$PNAME\tntfsclone\tOK\t$sz" >> "$STATUS_LOG"
-              diag "[ARCH] Done: $PNAME via ntfsclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+            if [ $rc -eq 0 ]; then
+              if   [ -s "${OUTBASE}.ntfs.zst" ]; then OUTFILE="${OUTBASE}.ntfs.zst";
+              elif [ -s "${OUTBASE}.ntfs.gz"  ]; then OUTFILE="${OUTBASE}.ntfs.gz"; else OUTFILE=""; fi
+              if [ -n "$OUTFILE" ]; then
+                sz=$(stat -c %s "$OUTFILE" 2>/dev/null || echo 0)
+                echo -e "$PNAME\tntfsclone\tOK\t$sz" >> "$STATUS_LOG"
+                diag "[ARCH] Done: $PNAME via ntfsclone (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+              else
+                echo -e "$PNAME\tntfsclone\tFAIL\t0" >> "$STATUS_LOG"
+                echo "[ARCH] FAIL: $PNAME via ntfsclone (no output detected)" >&2
+              fi
             else
               echo -e "$PNAME\tntfsclone\tFAIL\t0" >> "$STATUS_LOG"
               echo "[ARCH] FAIL: $PNAME via ntfsclone (rc=$rc)" >&2
