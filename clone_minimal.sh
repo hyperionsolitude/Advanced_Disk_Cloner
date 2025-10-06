@@ -848,16 +848,15 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     # Package everything into a tarball (new-format archive) with progress
     diag "[ARCH] Packaging archive..."
     progress_msg "Packaging archive..."
-    PKG_BYTES=$(du -sb "$TMPDIR" 2>/dev/null | awk '{print $1}')
+    # Create a file list and remove files from TMPDIR as they are archived to reduce disk usage
+    PKG_LIST=$(mktemp -p "$TMPDIR" .pkglist.XXXXXX)
+    (cd "$TMPDIR" && find . -maxdepth 1 -type f -printf "%P\n" > "$PKG_LIST")
     if [ ${#TAR_COMP_FLAG[@]} -gt 0 ]; then
-      (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" .)
+      (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" --remove-files -T "$PKG_LIST")
     else
-      if command -v pv >/dev/null 2>&1 && [[ "$PKG_BYTES" =~ ^[0-9]+$ ]]; then
-        (cd "$TMPDIR" && tar -cz . | ${IONICE:+$IONICE }pv -s "$PKG_BYTES" > "$ARCH_TAR")
-      else
-        (cd "$TMPDIR" && tar -czf "$ARCH_TAR" .)
-      fi
+      (cd "$TMPDIR" && tar -cf "$ARCH_TAR" --remove-files -T "$PKG_LIST")
     fi
+    rm -f "$PKG_LIST" || true
     mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
     diag "\n[ARCH] Summary (partition, tool, status, size-bytes):"
     if [ "$VERBOSE" = "yes" ]; then sed -n '1,200p' "$STATUS_LOG" 2>/dev/null >&2 || true; fi
