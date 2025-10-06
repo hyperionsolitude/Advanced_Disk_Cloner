@@ -72,13 +72,6 @@ export ADC_TMPDIR=/mnt/fast-ssd/tmp
 - Choose Restore → select image → select target disk → when prompted, choose Partial restore and select partition numbers (e.g., `3` for `sdb3`).
 - Partition table is untouched; the target partition must exist and be large enough.
 
-## Diagnostics
-- A helper script collects boot diagnostics:
-```bash
-sudo bash collect_win_boot_diag.sh /dev/sdX /path/to/log.txt
-```
-- Captures `lsblk/blkid`, `sfdisk -d`, `gdisk -l`, `efibootmgr -v`, ESP contents, and recent kernel logs.
-
 ## Safety Notes
 - Windows: Disable Fast Startup/hibernation before archiving. On restore, preserve GUIDs when the clone will be used standalone. Randomize GUIDs only if both original and clone will be connected together; then repair BCD externally.
 - Live cloning of mounted systems is discouraged; the script warns but will proceed if confirmed.
