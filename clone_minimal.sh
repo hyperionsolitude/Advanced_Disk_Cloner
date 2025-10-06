@@ -24,7 +24,7 @@
 #
 # Performance:
 #   - Multi-threaded compression/decompression (pigz/zstd) using all CPU cores
-#   - zstd -3 preferred for strong ratio with minimal speed cost; pigz --rsyncable fallback
+#   - zstd -3 preferred for strong ratio with minimal speed cost; pigz fallback
 #   - Ionice and readahead tuning for smoother I/O
 #
 # Safety Notes:
@@ -86,8 +86,8 @@ if [ "$HAS_ZSTD" = "yes" ]; then
   PART_COMP_CMD_ZSTD="zstd -T${THREADS} -3"
   PART_DECOMP_CMD_ZSTD="zstd -T${THREADS} -d"
 elif [ "$HAS_PIGZ" = "yes" ]; then
-  # pigz -3 --rsyncable: better compression + rsync-friendly blocks
-  PIGZ_ARGS="-3 --rsyncable -p ${THREADS}"
+  # pigz -3: better compression with good speed
+  PIGZ_ARGS="-3 -p ${THREADS}"
   TAR_COMP_FLAG=( -I "pigz ${PIGZ_ARGS}" )
   TAR_DECOMP_FLAG=( -I "pigz -d -p ${THREADS}" )
   PART_EXT="gz"
