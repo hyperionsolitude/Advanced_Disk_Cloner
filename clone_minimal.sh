@@ -50,6 +50,20 @@ for __arg in "$@"; do
 done
 diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
 
+# --- macOS host detection: redirect to standalone script ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  MAC_SCRIPT="${SCRIPT_DIR}/adc_macos.sh"
+  if [ -x "$MAC_SCRIPT" ]; then
+    echo "Detected macOS. Launching standalone macOS edition..."
+    exec "$MAC_SCRIPT" "$@"
+  else
+    echo "ERROR: macOS detected but adc_macos.sh not found or not executable in $SCRIPT_DIR"
+    echo "Please ensure adc_macos.sh is present and executable (chmod +x adc_macos.sh)"
+    exit 1
+  fi
+fi
+
 # Timer functions for operation tracking (excludes user interaction time)
 OP_START_TIME=""
 start_op_timer() { OP_START_TIME=$(date +%s); }
@@ -266,9 +280,13 @@ require tar
 # Report archive capabilities
 HAS_PARTCLONE=no
 HAS_NTFSCLONE=no
+HAS_APFS_FUSE=no
+HAS_HFSPLUS=no
 if command -v partclone.extfs >/dev/null 2>&1; then HAS_PARTCLONE=yes; fi
 if command -v ntfsclone >/dev/null 2>&1; then HAS_NTFSCLONE=yes; fi
-echo "Archive mode: used-block ext4=$HAS_PARTCLONE, ntfs=$HAS_NTFSCLONE (fallback to raw for others)"
+if command -v apfs-fuse >/dev/null 2>&1 || command -v mount.apfs >/dev/null 2>&1; then HAS_APFS_FUSE=yes; fi
+if command -v fsck.hfsplus >/dev/null 2>&1 || command -v mount.hfsplus >/dev/null 2>&1; then HAS_HFSPLUS=yes; fi
+echo "Archive mode: used-block ext4=$HAS_PARTCLONE, ntfs=$HAS_NTFSCLONE, apfs/hfs+=$HAS_APFS_FUSE/$HAS_HFSPLUS (fallback to raw for others)"
 
 # Build numbered list of root disks: /dev/sd[a-z] and /dev/nvme*n1
 mapfile -t DISKS < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && ($1 ~ /^sd[a-z]+$/ || $1 ~ /^nvme[0-9]+n[0-9]+$/) {print $1}' | sort)
@@ -743,6 +761,62 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
               echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
               echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
             fi
+          fi
+          ;;
+        apfs)
+          # APFS: raw dump (no used-block tool available on Linux yet)
+          echo -e "$PNAME\tapfs\tdd" >> "$MANIFEST"
+          (
+            set +e -o pipefail
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=16M status=none | pv | gzip -3 > "${OUTBASE}.raw.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=16M status=progress | gzip -3 > "${OUTBASE}.raw.gz"
+      fi
+    fi
+          ); rc=$?
+          if [ $rc -eq 0 ] && [ -s "${OUTBASE}.raw.gz" ]; then
+            sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
+            echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
+            diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+          else
+            echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
+            echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
+          fi
+          ;;
+        hfsplus|hfs)
+          # HFS+: raw dump
+          echo -e "$PNAME\t$FST\tdd" >> "$MANIFEST"
+          (
+            set +e -o pipefail
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=16M status=none | pv | gzip -3 > "${OUTBASE}.raw.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=16M status=progress | gzip -3 > "${OUTBASE}.raw.gz"
+      fi
+    fi
+          ); rc=$?
+          if [ $rc -eq 0 ] && [ -s "${OUTBASE}.raw.gz" ]; then
+            sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
+            echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
+            diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+          else
+            echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
+            echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
           fi
           ;;
         ntfs)
