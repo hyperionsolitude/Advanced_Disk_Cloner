@@ -255,7 +255,7 @@ ensure_commands() {
 # Always attempt to install prerequisites on Ubuntu (non-fatal)
 echo "Ensuring required commands are available..."
 # Core + feature commands needed by this script
-ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs pigz
+ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs pigz zstd
 
 # Ensure minimally required commands exist after best-effort install
 require dd
@@ -892,12 +892,75 @@ else
   fi
   diag "[RESTORE] Extracting archive..."
   progress_msg "Extracting archive..."
-  # Stream extraction directly via tar to avoid any pre-read overhead
-  if [ ${#TAR_DECOMP_FLAG[@]} -gt 0 ]; then
-    if tar --no-same-owner "${TAR_DECOMP_FLAG[@]}" -x -f "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then ARCH_IS_TAR=yes; fi
+  
+  # Enhanced archive detection: check file content, not just extension
+  ARCH_IS_TAR=no
+  ARCH_FORMAT=""
+  
+  # Detect compression format from filename first
+  if [[ "$ARCH" == *.tar.zst ]] || [[ "$ARCH" == *.zst ]]; then
+    ARCH_FORMAT="zst"
+  elif [[ "$ARCH" == *.tar.gz ]] || [[ "$ARCH" == *.tgz ]] || [[ "$ARCH" == *.gz ]]; then
+    ARCH_FORMAT="gz"
+  elif [[ "$ARCH" == *.tar ]]; then
+    ARCH_FORMAT="tar"
   else
-    if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then ARCH_IS_TAR=yes; fi
+    # Auto-detect from file content using 'file' command
+    FILE_TYPE=$(file -b "$ARCH" 2>/dev/null || echo "unknown")
+    if [[ "$FILE_TYPE" == *"zstd"* ]]; then
+      ARCH_FORMAT="zst"
+    elif [[ "$FILE_TYPE" == *"gzip"* ]]; then
+      ARCH_FORMAT="gz"
+    elif [[ "$FILE_TYPE" == *"POSIX tar"* ]]; then
+      ARCH_FORMAT="tar"
+    else
+      ARCH_FORMAT="unknown"
+    fi
   fi
+  
+  diag "[RESTORE] Detected archive format: $ARCH_FORMAT"
+  
+  # Extract based on detected format
+  case "$ARCH_FORMAT" in
+    "zst")
+      if [ "$HAS_ZSTD" = "yes" ]; then
+        if zstd -dc "$ARCH" | tar --no-same-owner -xf - -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then
+          ARCH_IS_TAR=yes
+        fi
+      else
+        echo "ERROR: Archive is zstd-compressed but zstd is not available" >&2
+        exit 1
+      fi
+      ;;
+    "gz")
+      if [ "$HAS_PIGZ" = "yes" ]; then
+        if pigz -dc "$ARCH" | tar --no-same-owner -xf - -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then
+          ARCH_IS_TAR=yes
+        fi
+      else
+        if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then
+          ARCH_IS_TAR=yes
+        fi
+      fi
+      ;;
+    "tar")
+      if tar --no-same-owner -xf "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then
+        ARCH_IS_TAR=yes
+      fi
+      ;;
+    *)
+      # Fallback: try different methods
+      if [ ${#TAR_DECOMP_FLAG[@]} -gt 0 ]; then
+        if tar --no-same-owner "${TAR_DECOMP_FLAG[@]}" -x -f "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then
+          ARCH_IS_TAR=yes
+        fi
+      else
+        if tar --no-same-owner -xzf "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then
+          ARCH_IS_TAR=yes
+        fi
+      fi
+      ;;
+  esac
   if [ "$ARCH_IS_TAR" = "yes" ]; then
     cleanup_tmp() {
       # Only remove temp if RESTORE_OK=yes; keep on failure for diagnostics
@@ -1162,22 +1225,50 @@ else
             fi
             ;;
           dd)
-            if [ -f "${BASE}.raw.gz" ]; then
+            # Try different raw image formats in order of preference
+            IMGFILE=""
+            if [ -f "${BASE}.raw.zst" ]; then
+              IMGFILE="${BASE}.raw.zst"
+              if command -v zstd >/dev/null 2>&1; then
+                if command -v pv >/dev/null 2>&1; then
+                  zstd -dc -T${THREADS} "$IMGFILE" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+                else
+                  zstd -dc -T${THREADS} "$IMGFILE" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                fi
+              else
+                echo "WARN: zstd not available for $IMGFILE"
+              fi
+            elif [ -f "${BASE}.raw.gz" ]; then
+              IMGFILE="${BASE}.raw.gz"
               if command -v pigz >/dev/null 2>&1; then
                 if command -v pv >/dev/null 2>&1; then
-                  pigz -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+                  pigz -dc "$IMGFILE" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
                 else
-                  pigz -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                  pigz -dc "$IMGFILE" | dd of="$TDEV" bs=1M status=progress conv=fsync
                 fi
               else
                 if command -v pv >/dev/null 2>&1; then
-                  gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
+                  gzip -dc "$IMGFILE" | pv | dd of="$TDEV" bs=1M conv=fsync status=none
                 else
-                  gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=1M status=progress conv=fsync
+                  gzip -dc "$IMGFILE" | dd of="$TDEV" bs=1M status=progress conv=fsync
                 fi
               fi
+            elif [ -f "${BASE}.raw" ]; then
+              IMGFILE="${BASE}.raw"
+              if command -v pv >/dev/null 2>&1; then
+                pv "$IMGFILE" | dd of="$TDEV" bs=1M conv=fsync status=none
+              else
+                dd if="$IMGFILE" of="$TDEV" bs=1M status=progress conv=fsync
+              fi
+            elif [ -f "${BASE}.raw.raw" ]; then
+              IMGFILE="${BASE}.raw.raw"
+              if command -v pv >/dev/null 2>&1; then
+                pv "$IMGFILE" | dd of="$TDEV" bs=1M conv=fsync status=none
+              else
+                dd if="$IMGFILE" of="$TDEV" bs=1M status=progress conv=fsync
+              fi
             else
-              echo "WARN: missing raw image for $PNAME"
+              echo "WARN: missing raw image for $PNAME (tried .zst/.gz/.raw/.raw.raw)"
             fi
             ;;
         esac
@@ -1266,23 +1357,51 @@ else
               fi
               ;;
             dd)
-            if [ -f "${BASE}.raw.${PART_EXT}" ]; then
+            # Try different raw image formats in order of preference
+            IMGFILE=""
+            if [ -f "${BASE}.raw.zst" ]; then
+              IMGFILE="${BASE}.raw.zst"
+              if command -v zstd >/dev/null 2>&1; then
+                if command -v pv >/dev/null 2>&1; then
+                  zstd -dc -T${THREADS} "$IMGFILE" | pv | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
+                else
+                  zstd -dc -T${THREADS} "$IMGFILE" | dd of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
+                fi
+              else
+                echo "WARN: zstd not available for $IMGFILE"
+              fi
+            elif [ -f "${BASE}.raw.gz" ]; then
+              IMGFILE="${BASE}.raw.gz"
+              if command -v pigz >/dev/null 2>&1; then
+                if command -v pv >/dev/null 2>&1; then
+                  pigz -dc "$IMGFILE" | pv | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
+                else
+                  pigz -dc "$IMGFILE" | dd of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
+                fi
+              else
+                if command -v pv >/dev/null 2>&1; then
+                  gzip -dc "$IMGFILE" | pv | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
+                else
+                  gzip -dc "$IMGFILE" | dd of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
+                fi
+              fi
+            elif [ -f "${BASE}.raw" ]; then
+              IMGFILE="${BASE}.raw"
               if command -v pv >/dev/null 2>&1; then
-                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
-                  zstd -dc -T${THREADS} "${BASE}.raw.zst" | pv | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
-                else
-                  gzip -dc "${BASE}.raw.gz" | pv | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
-                fi
+                pv "$IMGFILE" | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
               else
-                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
-                  zstd -dc -T${THREADS} "${BASE}.raw.zst" | dd of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
-                else
-                  gzip -dc "${BASE}.raw.gz" | dd of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
-                fi
+                dd if="$IMGFILE" of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
               fi
+            elif [ -f "${BASE}.raw.raw" ]; then
+              IMGFILE="${BASE}.raw.raw"
+              if command -v pv >/dev/null 2>&1; then
+                pv "$IMGFILE" | dd of="$TDEV" bs=16M ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync status=none
               else
-                echo "WARN: missing raw image for $PNAME"
+                dd if="$IMGFILE" of="$TDEV" bs=16M status=progress ${DD_OFLAGS:+$DD_OFLAGS} conv=fsync
               fi
+            else
+              echo "WARN: missing raw image for $PNAME (tried .zst/.gz/.raw/.raw.raw)"
+            fi
               ;;
           esac
           sync
