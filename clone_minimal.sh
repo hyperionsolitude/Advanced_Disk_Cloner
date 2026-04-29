@@ -48,7 +48,9 @@ OFFLINE_BUNDLE_DIR="${ADC_DEB_BUNDLE:-}"
 OFFLINE_BUNDLE_ARCHIVE=""
 BUNDLE_DEPS_DIR=""
 BUNDLE_DEPS_ARCHIVE=""
+BUILD_DEB_TARGET=""
 SELF_TEST=no
+UI_MODE="${ADC_UI:-0}"
 
 show_help() {
   cat <<'EOF'
@@ -61,6 +63,7 @@ Options:
   -v, --verbose                      Enable verbose diagnostics
   --self-test                        Run environment self-test and exit
   --help                             Show this help and exit
+  --ui                               Force whiptail dialog mode for prompts
 
 Offline package prep/install:
   --bundle-deps <dir>                Download required .deb packages into directory
@@ -69,10 +72,13 @@ Offline package prep/install:
   --offline                          Enable offline install mode (requires bundle source)
   --offline-bundle <dir>             Install required packages from bundle directory
   --offline-archive <file>           Install required packages from archive file
+  --build-deb <path|dir>             Build installable .deb package for this app
+                                      - If a directory is given, auto-generates package name
 
 Examples:
   sudo ./clone_minimal.sh --bundle-deps-archive ./
   sudo ./clone_minimal.sh --offline-archive ./adc-offline-pkgs-YYYYMMDD-HHMMSS.tar.gz
+  sudo ./clone_minimal.sh --build-deb ./
   sudo ./clone_minimal.sh -v
 EOF
 }
@@ -80,6 +86,7 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) show_help; exit 0 ;;
+    --ui) UI_MODE=1; shift ;;
     -v|--verbose) VERBOSE=yes; shift ;;
     --offline) OFFLINE_MODE=yes; shift ;;
     --offline-bundle)
@@ -104,15 +111,130 @@ while [ "$#" -gt 0 ]; do
       BUNDLE_DEPS_ARCHIVE="$2"
       shift 2
       ;;
+    --build-deb)
+      [ "$#" -ge 2 ] || { echo "ERROR: --build-deb requires a path"; exit 1; }
+      BUILD_DEB_TARGET="$2"
+      shift 2
+      ;;
     --self-test) SELF_TEST=yes; shift ;;
     *)
       echo "Unknown argument: $1"
-      echo "Usage: sudo ./clone_minimal.sh [-v|--verbose] [--offline] [--offline-bundle <dir>] [--offline-archive <file>] [--bundle-deps <dir>] [--bundle-deps-archive <file>] [--self-test]"
+      echo "Usage: sudo ./clone_minimal.sh [-v|--verbose] [--offline] [--offline-bundle <dir>] [--offline-archive <file>] [--bundle-deps <dir>] [--bundle-deps-archive <file>] [--build-deb <path|dir>] [--self-test]"
       exit 1
       ;;
   esac
 done
 diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
+
+ui_read() {
+  local prompt="" varname="" default="" use_readline=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -p) prompt="${2:-}"; shift 2 ;;
+      -i) default="${2:-}"; shift 2 ;;
+      -e) use_readline=1; shift ;;
+      -r) shift ;;
+      # Support combined read flags used throughout script, e.g. -rp / -erp.
+      -*)
+        local _opt="$1"
+        if [[ "$_opt" == *e* ]]; then use_readline=1; fi
+        if [[ "$_opt" == *p* ]]; then
+          prompt="${2:-}"
+          shift 2
+        else
+          shift
+        fi
+        ;;
+      --) shift; break ;;
+      *) varname="$1"; shift ;;
+    esac
+  done
+  [ -n "$varname" ] || return 1
+
+  # Non-tty reads (e.g. here-strings) must use builtin read.
+  if [ "$UI_MODE" != "1" ] || ! [ -t 0 ] || ! command -v whiptail >/dev/null 2>&1; then
+    builtin read -r -p "$prompt" "$varname"
+    return $?
+  fi
+
+  local input=""
+  if [ -z "$prompt" ]; then
+    prompt="Enter value:"
+  fi
+
+  # Adapt dialog size to current terminal to avoid clipped rendering.
+  local term_h term_w box_h box_w
+  term_h=$(tput lines 2>/dev/null || echo 24)
+  term_w=$(tput cols 2>/dev/null || echo 80)
+  box_h=$((term_h - 4))
+  box_w=$((term_w - 4))
+  [ "$box_h" -lt 10 ] && box_h=10
+  [ "$box_w" -lt 50 ] && box_w=50
+  [ "$box_h" -gt 20 ] && box_h=20
+  [ "$box_w" -gt 100 ] && box_w=100
+
+  local ui_title="Advanced Disk Cloner"
+  local ui_backtitle="Safe Clone • Archive • Restore"
+
+  # Convert classic yes/no prompts into real yes/no dialogs.
+  if [[ "$prompt" =~ \([Yy]/[Nn]\)|\([Yy]/[Nn]\):|\(y/N\)|\(Y/N\)|Proceed|confirm ]]; then
+    if whiptail --backtitle "$ui_backtitle" --title "$ui_title" --yesno "$prompt" "$box_h" "$box_w"; then
+      input="y"
+    else
+      input="n"
+    fi
+  else
+    input=$(whiptail --backtitle "$ui_backtitle" --title "$ui_title" --inputbox "$prompt" "$box_h" "$box_w" "$default" 3>&1 1>&2 2>&3) || return 1
+  fi
+
+  printf -v "$varname" '%s' "$input"
+  return 0
+}
+
+# Override read only in UI mode to keep existing flow.
+read() {
+  if [ "$UI_MODE" = "1" ]; then
+    ui_read "$@"
+  else
+    builtin read "$@"
+  fi
+}
+
+ui_msg_box() {
+  local title="$1" msg="$2"
+  if [ "$UI_MODE" = "1" ] && [ -t 0 ] && command -v whiptail >/dev/null 2>&1; then
+    whiptail --backtitle "Safe Clone - Archive - Restore" --title "$title" --msgbox "$msg" 12 80 || true
+  fi
+}
+
+ui_warn() {
+  echo "WARNING: $*" >&2
+  ui_msg_box "Warning" "$*"
+}
+
+ui_error() {
+  echo "ERROR: $*" >&2
+  ui_msg_box "Error" "$*"
+}
+
+ui_pick_disk_index() {
+  local title="$1" prompt="$2"
+  if [ "$UI_MODE" != "1" ] || ! command -v whiptail >/dev/null 2>&1; then
+    return 1
+  fi
+  local menu_args=()
+  local i name size model ptt
+  for i in "${!DISKS[@]}"; do
+    name="${DISKS[$i]}"
+    size=$(lsblk -dn -o SIZE "/dev/$name" 2>/dev/null || echo "?")
+    model=$(lsblk -dn -o MODEL "/dev/$name" 2>/dev/null | sed 's/^ *$/(unknown)/')
+    ptt=$(lsblk -dn -o PTTYPE "/dev/$name" 2>/dev/null || echo "?")
+    menu_args+=("$((i+1))" "/dev/$name  size=$size  model=$model  pttype=${ptt:-?}")
+  done
+  local choice
+  choice=$(whiptail --backtitle "Safe Clone • Archive • Restore" --title "$title" --menu "$prompt" 22 110 14 "${menu_args[@]}" 3>&1 1>&2 2>&3) || return 1
+  echo "$choice"
+}
 
 # Timer functions for operation tracking (excludes user interaction time)
 OP_START_TIME=""
@@ -183,6 +305,7 @@ set_readahead() {
 restore_readahead() {
   [ -n "$ORIG_RA_SRC" ] && set_readahead "${SRC}" "$ORIG_RA_SRC"
   [ -n "$ORIG_RA_DST" ] && [ -n "${DST:-}" ] && set_readahead "${DST}" "$ORIG_RA_DST"
+  return 0
 }
 trap 'restore_readahead' EXIT INT TERM HUP
 
@@ -226,10 +349,13 @@ fix_owner_if_sudo() {
   if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
     chown -R "${SUDO_UID}:${SUDO_GID}" "$target" 2>/dev/null || true
   fi
+  return 0
 }
 
 # All Ubuntu packages needed for this script.
 REQ_PACKAGES=(coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs pigz zstd)
+# Extra packages for packaged app UX/runtime.
+APP_DEB_PACKAGES=(whiptail sudo bash)
 
 # Download prerequisite packages for offline usage and exit.
 bundle_prerequisites() {
@@ -239,6 +365,12 @@ bundle_prerequisites() {
     exit 1
   fi
   mkdir -p "$bundle_dir/partial"
+  # Allow apt sandbox user (_apt) to access cache path cleanly, avoiding
+  # "Download is performed unsandboxed as root" warnings.
+  if id _apt >/dev/null 2>&1; then
+    run_root chown _apt:root "$bundle_dir" "$bundle_dir/partial" 2>/dev/null || true
+    run_root chmod 0755 "$bundle_dir" "$bundle_dir/partial" 2>/dev/null || true
+  fi
   export DEBIAN_FRONTEND=noninteractive
   echo "Preparing offline package bundle in: $bundle_dir"
   run_root bash -lc 'cache_dir="$1"; shift; apt-get update -y && apt-get install -y --download-only --reinstall -o Dir::Cache::archives="$cache_dir" "$@"' _ "$bundle_dir" "${REQ_PACKAGES[@]}"
@@ -279,6 +411,151 @@ bundle_prerequisites_archive() {
   echo "Offline package archive created: $archive_path"
   echo "Use it on fresh/offline system with:"
   echo "  sudo ./clone_minimal.sh --offline-archive \"$archive_path\""
+}
+
+# Build a Debian package containing this app and a friendly launcher UI.
+build_deb_package() {
+  local target_input="$1"
+  local deb_output="$target_input"
+  local out_dir=""
+  local pkg_name="advanced-disk-cloner"
+  local version
+  version="$(date +%Y.%m.%d.%H%M)"
+
+  if [ -d "$target_input" ] || [[ "$target_input" == */ ]]; then
+    out_dir="${target_input%/}"
+    mkdir -p "$out_dir"
+    deb_output="${out_dir}/${pkg_name}_${version}_all.deb"
+  else
+    out_dir=$(dirname "$deb_output")
+    mkdir -p "$out_dir"
+    if [[ "$deb_output" != *.deb ]]; then
+      deb_output="${deb_output}.deb"
+    fi
+  fi
+
+  command -v dpkg-deb >/dev/null 2>&1 || {
+    echo "ERROR: dpkg-deb is required to build a .deb package." >&2
+    echo "Install with: sudo apt-get install -y dpkg-dev" >&2
+    exit 1
+  }
+
+  local pkg_root
+  pkg_root=$(mktemp -d)
+  local dep_bundle
+  dep_bundle=$(mktemp -d)
+  local script_src
+  script_src=$(readlink -f "$0")
+
+  mkdir -p "$pkg_root/DEBIAN" "$pkg_root/opt/advanced-disk-cloner" "$pkg_root/opt/advanced-disk-cloner/offline-debs" "$pkg_root/usr/local/bin"
+
+  echo "Embedding offline dependency packages into .deb (this can take a while)..."
+  bundle_prerequisites "$dep_bundle"
+  run_root bash -lc 'cache_dir="$1"; shift; apt-get install -y --download-only --reinstall -o Dir::Cache::archives="$cache_dir" "$@"' _ "$dep_bundle" "${APP_DEB_PACKAGES[@]}"
+  mapfile -t embedded_debs < <(ls "$dep_bundle"/*.deb 2>/dev/null || true)
+  if [ ${#embedded_debs[@]} -eq 0 ]; then
+    echo "ERROR: Could not download dependency packages for all-in-one installer." >&2
+    rm -rf "$pkg_root" "$dep_bundle"
+    exit 1
+  fi
+  cp -f "$dep_bundle"/*.deb "$pkg_root/opt/advanced-disk-cloner/offline-debs/"
+  printf '%s\n' "${REQ_PACKAGES[@]}" "${APP_DEB_PACKAGES[@]}" | awk 'NF{if(!seen[$0]++) print $0}' > "$pkg_root/opt/advanced-disk-cloner/offline-debs/required-packages.txt"
+
+  cp -f "$script_src" "$pkg_root/opt/advanced-disk-cloner/clone_minimal.sh"
+  chmod 0755 "$pkg_root/opt/advanced-disk-cloner/clone_minimal.sh"
+
+  cat > "$pkg_root/usr/local/bin/advanced-disk-cloner" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP="/opt/advanced-disk-cloner/clone_minimal.sh"
+OFFLINE_DEBS="/opt/advanced-disk-cloner/offline-debs"
+TITLE="Advanced Disk Cloner"
+BACKTITLE="Safe Clone - Archive - Restore"
+[ -x "$APP" ] || { echo "Backend script not found: $APP"; exit 1; }
+
+# Install embedded dependencies outside dpkg postinst context.
+ensure_embedded_deps() {
+  [ -d "$OFFLINE_DEBS" ] || return 0
+  mapfile -t _debs < <(ls "$OFFLINE_DEBS"/*.deb 2>/dev/null || true)
+  [ ${#_debs[@]} -gt 0 ] || return 0
+  if [ -f "$OFFLINE_DEBS/required-packages.txt" ]; then
+    mapfile -t _pkgs < "$OFFLINE_DEBS/required-packages.txt"
+    if [ "${#_pkgs[@]}" -gt 0 ]; then
+      sudo bash -lc 'deb_dir="$1"; shift; cp -f "$deb_dir"/*.deb /var/cache/apt/archives/ && apt-get install -y --no-download "$@"' _ "$OFFLINE_DEBS" "${_pkgs[@]}" || true
+    fi
+  fi
+}
+
+# Ensure embedded dependencies are present before UI checks.
+ensure_embedded_deps
+
+if ! command -v whiptail >/dev/null 2>&1; then
+  echo "Friendly UI requires whiptail. Falling back to CLI..."
+  exec sudo "$APP"
+fi
+
+whiptail --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "Welcome.\n\nUse arrow keys to navigate, Enter to select, and Tab to switch buttons." 12 72
+
+while true; do
+  CHOICE=$(whiptail --backtitle "$BACKTITLE" --title "$TITLE" --menu "Choose an action" 20 78 10 \
+    "1" "Start Cloner (guided)" \
+    "2" "Start Cloner (verbose diagnostics)" \
+    "3" "Run self-test" \
+    "4" "Create Offline Package Archive" \
+    "5" "Show help" \
+    "6" "Exit" \
+    3>&1 1>&2 2>&3) || exit 0
+
+  case "$CHOICE" in
+    1) sudo ADC_UI=1 "$APP" --ui ;;
+    2) sudo ADC_UI=1 "$APP" --ui -v ;;
+    3) sudo "$APP" --self-test | whiptail --backtitle "$BACKTITLE" --title "Self-test Output" --scrolltext --textbox /dev/stdin 25 100 ;;
+    4)
+      OUT=$(whiptail --backtitle "$BACKTITLE" --title "$TITLE" --inputbox "Output directory for archive (e.g. /tmp or /home/user)" 10 78 "./" 3>&1 1>&2 2>&3) || continue
+      whiptail --backtitle "$BACKTITLE" --title "$TITLE" --infobox "Creating offline archive...\nThis may take a while." 8 60
+      sudo "$APP" --bundle-deps-archive "$OUT"
+      whiptail --backtitle "$BACKTITLE" --title "$TITLE" --msgbox "Offline archive creation completed." 9 60
+      ;;
+    5)
+      "$APP" --help | whiptail --backtitle "$BACKTITLE" --title "Help" --scrolltext --textbox /dev/stdin 30 100
+      ;;
+    6) exit 0 ;;
+  esac
+done
+EOF
+  chmod 0755 "$pkg_root/usr/local/bin/advanced-disk-cloner"
+
+  cat > "$pkg_root/DEBIAN/postinst" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "advanced-disk-cloner installed."
+echo "Embedded offline dependencies will be installed automatically on first launch."
+
+exit 0
+EOF
+  chmod 0755 "$pkg_root/DEBIAN/postinst"
+
+  cat > "$pkg_root/DEBIAN/control" <<EOF
+Package: ${pkg_name}
+Version: ${version}
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: ${USER:-adc} <${USER:-adc}@local>
+Depends: dpkg, apt
+Description: Advanced Disk Cloner with all-in-one offline installer
+ Menu-driven disk cloner/archiver/restorer with offline dependency
+ archive generation, embedded runtime packages, and a friendly launcher UI.
+EOF
+
+  dpkg-deb --build "$pkg_root" "$deb_output" >/dev/null
+  rm -rf "$pkg_root" "$dep_bundle"
+  fix_owner_if_sudo "$deb_output"
+  echo "Debian package created: $deb_output"
+  echo "Install with: sudo dpkg -i \"$deb_output\""
+  echo "Run UI with: advanced-disk-cloner"
 }
 
 # Extract archive into a temporary bundle directory.
@@ -363,6 +640,11 @@ fi
 
 if [ -n "$BUNDLE_DEPS_ARCHIVE" ]; then
   bundle_prerequisites_archive "$BUNDLE_DEPS_ARCHIVE"
+  exit 0
+fi
+
+if [ -n "$BUILD_DEB_TARGET" ]; then
+  build_deb_package "$BUILD_DEB_TARGET"
   exit 0
 fi
 
@@ -454,7 +736,8 @@ echo "Archive mode: used-block ext4=$HAS_PARTCLONE, ntfs=$HAS_NTFSCLONE (fallbac
 mapfile -t DISKS < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && ($1 ~ /^sd[a-z]+$/ || $1 ~ /^nvme[0-9]+n[0-9]+$/) {print $1}' | sort)
 
 if [ ${#DISKS[@]} -eq 0 ]; then
-  echo "No /dev/sdX disks found."; exit 1
+  ui_error "No supported root disks were found (/dev/sdX or /dev/nvme*n1)."
+  exit 1
 fi
 
 echo "=== Available Disks (root disks only) ==="
@@ -467,14 +750,31 @@ for i in "${!DISKS[@]}"; do
 done
 echo ""
 
-read -rp "Select SOURCE number: " SRC_IDX
-read -rp "Operation: [C]lone to device, [A]rchive image, or [R]estore from image? (C/A/R): " OP
+if [ "$UI_MODE" = "1" ] && command -v whiptail >/dev/null 2>&1; then
+  SRC_IDX=$(ui_pick_disk_index "Advanced Disk Cloner" "Select SOURCE disk") || { echo "Cancelled"; exit 1; }
+else
+  read -rp "Select SOURCE number: " SRC_IDX
+fi
+
+if [ "$UI_MODE" = "1" ] && command -v whiptail >/dev/null 2>&1; then
+  OP=$(whiptail --title "Advanced Disk Cloner" --menu "Select operation" 16 70 6 \
+    "C" "Clone disk to disk" \
+    "A" "Archive disk to image" \
+    "R" "Restore image to disk" \
+    3>&1 1>&2 2>&3) || { echo "Cancelled"; exit 1; }
+else
+  read -rp "Operation: [C]lone to device, [A]rchive image, or [R]estore from image? (C/A/R): " OP
+fi
 OP=${OP:-C}
 if [[ ! "$OP" =~ ^[CcAaRr]$ ]]; then echo "Invalid choice"; exit 1; fi
 
 DST_IDX=-1
 if [[ "$OP" =~ ^[Cc]$ ]]; then
-  read -rp "Select TARGET number: " DST_IDX
+  if [ "$UI_MODE" = "1" ] && command -v whiptail >/dev/null 2>&1; then
+    DST_IDX=$(ui_pick_disk_index "Advanced Disk Cloner" "Select TARGET disk (will be erased)") || { echo "Cancelled"; exit 1; }
+  else
+    read -rp "Select TARGET number: " DST_IDX
+  fi
 fi
 
 if ! [[ "$SRC_IDX" =~ ^[0-9]+$ ]]; then
@@ -663,7 +963,11 @@ elif [[ "$OP" =~ ^[Rr]$ ]]; then
     NAME="${DISKS[$i]}"; SIZE=$(lsblk -dn -o SIZE "/dev/$NAME"); MODEL=$(lsblk -dn -o MODEL "/dev/$NAME" | sed 's/^ *$/(unknown)/')
     echo "[$((i+1))] /dev/$NAME  size=$SIZE  model=$MODEL"
   done
-  read -rp "Select TARGET number for restore: " DST_IDX
+  if [ "$UI_MODE" = "1" ] && command -v whiptail >/dev/null 2>&1; then
+    DST_IDX=$(ui_pick_disk_index "Advanced Disk Cloner" "Select TARGET disk for restore (will be erased)") || { echo "Cancelled"; exit 1; }
+  else
+    read -rp "Select TARGET number for restore: " DST_IDX
+  fi
   DST_IDX=$((DST_IDX-1))
   if [ "$DST_IDX" -lt 0 ] || [ "$DST_IDX" -ge ${#DISKS[@]} ]; then echo "ERROR: target selection out of range"; exit 1; fi
   DST="/dev/${DISKS[$DST_IDX]}"
@@ -675,7 +979,7 @@ elif [[ "$OP" =~ ^[Rr]$ ]]; then
 fi
 
 if [ "$LIVE_ON_SOURCE" -eq 1 ]; then
-  echo "WARNING: You are operating on the current system disk (contains /)."
+  ui_warn "You are operating on the current system disk (contains /)."
   echo "- Live cloning may produce an inconsistent image."
   read -rp "Proceed with READ-ONLY cloning/archiving anyway? (y/N): " PROCEED_LIVE
   [[ "$PROCEED_LIVE" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
@@ -690,7 +994,7 @@ fi
 
 # Warn if source has mounted partitions (cloning a live system can cause inconsistencies)
 if mount | awk -v d="$SRC" '$1 ~ d {found=1} END{exit !found}'; then
-  echo "WARNING: Some partitions on $SRC are mounted. Cloning a live system may cause inconsistencies."
+  ui_warn "Some partitions on $SRC are mounted. Cloning a live system may cause inconsistencies."
   read -rp "Proceed anyway? (y/N): " PROCLIVE
   [[ "$PROCLIVE" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
 fi
@@ -745,12 +1049,14 @@ done
 # Get device sizes with error checking
 SRC_BYTES=$(blockdev --getsize64 "$SRC" 2>/dev/null || echo "0")
 if [[ ! "$SRC_BYTES" =~ ^[0-9]+$ ]] || [ "$SRC_BYTES" -eq 0 ]; then
-  echo "ERROR: Could not determine source device size: $SRC"; exit 1
+  ui_error "Could not determine source device size: $SRC"
+  exit 1
 fi
 if [[ "$OP" =~ ^[Cc]$ ]]; then
   DST_BYTES=$(blockdev --getsize64 "$DST" 2>/dev/null || echo "0")
   if [[ ! "$DST_BYTES" =~ ^[0-9]+$ ]] || [ "$DST_BYTES" -eq 0 ]; then
-    echo "ERROR: Could not determine target device size: $DST"; exit 1
+    ui_error "Could not determine target device size: $DST"
+    exit 1
   fi
 else
   DST_BYTES=0
@@ -770,7 +1076,7 @@ if [[ "$OP" =~ ^[Cc]$ ]]; then
     echo "Target disk size:                               ${DST_BYTES} bytes"
   fi
   if [ "$SRC_BYTES" -gt "$DST_BYTES" ]; then
-    echo "ERROR: Target is smaller than source; cannot proceed."
+    ui_error "Target is smaller than source; cannot proceed."
     exit 1
   fi
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
@@ -1108,7 +1414,7 @@ else
           ARCH_IS_TAR=yes
         fi
       else
-        echo "ERROR: Archive is zstd-compressed but zstd is not available" >&2
+        ui_error "Archive is zstd-compressed but zstd is not available."
         exit 1
       fi
       ;;
@@ -1356,7 +1662,8 @@ else
           echo "No valid partitions selected; cancelling."; exit 1
         fi
       else
-        echo "ERROR: manifest.tsv not found in archive"; exit 1
+        ui_error "manifest.tsv not found in archive."
+        exit 1
       fi
     fi
     # Restore per manifest order
@@ -1455,7 +1762,7 @@ else
         sync
       done < "$TMPDIR/manifest.tsv"
     else
-      echo "ERROR: manifest.tsv not found in archive"
+      ui_error "manifest.tsv not found in archive."
     fi
     # Cleanup handled by trap (conditioned on RESTORE_OK)
     RESTORE_OK=yes

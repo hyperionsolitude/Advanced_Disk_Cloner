@@ -1,0 +1,52 @@
+name: Build And Publish DEB
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deb-release-main
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev whiptail
+
+      - name: Build DEB package
+        run: |
+          mkdir -p dist
+          sudo ./clone_minimal.sh --build-deb ./dist/
+          sudo chown -R "$USER:$USER" dist
+          ls -lah dist
+
+      - name: Move rolling tag to current commit
+        run: |
+          git tag -f deb-latest
+          git push origin refs/tags/deb-latest --force
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: deb-latest
+          name: Advanced Disk Cloner - Latest DEB
+          body: |
+            Automated DEB build from the latest `main` push.
+            This release is updated on every push.
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/*.deb

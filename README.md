@@ -65,6 +65,40 @@ Then on a fresh/offline system:
 sudo ./clone_minimal.sh --offline-archive /path/to/adc-offline-pkgs.tar.gz
 ```
 
+## Build Installable Debian Package (.deb)
+You can generate a **true offline all-in-one** `.deb` installer directly from the script.  
+The produced package embeds required runtime packages and installs them during `dpkg -i`.
+
+```bash
+sudo ./clone_minimal.sh --build-deb /path/to/output-dir/
+```
+
+Or provide an explicit package filename:
+
+```bash
+sudo ./clone_minimal.sh --build-deb /path/to/advanced-disk-cloner.deb
+```
+
+Install on target system:
+
+```bash
+sudo dpkg -i /path/to/advanced-disk-cloner*.deb
+```
+
+Note: dependency installation from embedded offline packages is applied on first app launch (not during `dpkg -i`) to avoid dpkg lock conflicts.
+
+After install, launch friendly UI:
+
+```bash
+advanced-disk-cloner
+```
+
+You can also force dialog mode directly:
+
+```bash
+sudo ./clone_minimal.sh --ui
+```
+
 ## Usage
 - Verbose mode (diagnostics):
 ```bash
