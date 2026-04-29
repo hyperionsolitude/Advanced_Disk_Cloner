@@ -35,10 +35,44 @@ No install needed. Clone/Download this repo and run the script:
 sudo ./clone_minimal.sh
 ```
 
+## Offline-Friendly Usage (Preloaded Packages)
+To run on machines with no internet, pre-download Ubuntu dependency packages on an online machine:
+
+```bash
+sudo ./clone_minimal.sh --bundle-deps /path/to/adc-debs
+```
+
+Copy that folder to the offline machine, then run:
+
+```bash
+sudo ./clone_minimal.sh --offline-bundle /path/to/adc-debs
+```
+
+You can also export `ADC_DEB_BUNDLE` and use `--offline`.
+
+### Single-file offline package archive (recommended)
+Create one archive that contains all required packages:
+
+```bash
+sudo ./clone_minimal.sh --bundle-deps-archive /path/to/adc-offline-pkgs.tar.gz
+```
+
+You can also pass only a directory path (no file name); the script auto-creates a timestamped archive name in that directory.
+
+Then on a fresh/offline system:
+
+```bash
+sudo ./clone_minimal.sh --offline-archive /path/to/adc-offline-pkgs.tar.gz
+```
+
 ## Usage
 - Verbose mode (diagnostics):
 ```bash
 sudo ./clone_minimal.sh -v
+```
+- Self-test:
+```bash
+sudo ./clone_minimal.sh --self-test
 ```
 
 ### Operations

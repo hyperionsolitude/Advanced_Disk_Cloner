@@ -34,18 +34,82 @@
 #   - Partial restore will not touch the GPT; ensure target partitions are correctly sized and unmounted.
 #
 # Usage:
-#   sudo ./clone_minimal.sh [-v|--verbose]
+#   sudo ./clone_minimal.sh [-v|--verbose] [--offline] [--offline-bundle <dir>] [--offline-archive <file>] [--bundle-deps <dir>] [--bundle-deps-archive <file>] [--self-test]
 #
 # License: MIT
 #
 
 set -euo pipefail
 
-# Verbosity control: pass -v or --verbose to enable diagnostic logs
+# CLI flags
 VERBOSE=no
-for __arg in "$@"; do
-  case "$__arg" in
-    -v|--verbose) VERBOSE=yes ;;
+OFFLINE_MODE=no
+OFFLINE_BUNDLE_DIR="${ADC_DEB_BUNDLE:-}"
+OFFLINE_BUNDLE_ARCHIVE=""
+BUNDLE_DEPS_DIR=""
+BUNDLE_DEPS_ARCHIVE=""
+SELF_TEST=no
+
+show_help() {
+  cat <<'EOF'
+Advanced Disk Cloner
+
+Usage:
+  sudo ./clone_minimal.sh [options]
+
+Options:
+  -v, --verbose                      Enable verbose diagnostics
+  --self-test                        Run environment self-test and exit
+  --help                             Show this help and exit
+
+Offline package prep/install:
+  --bundle-deps <dir>                Download required .deb packages into directory
+  --bundle-deps-archive <path|dir>   Create offline package archive (.tar.gz)
+                                      - If a directory is given, auto-generates archive name
+  --offline                          Enable offline install mode (requires bundle source)
+  --offline-bundle <dir>             Install required packages from bundle directory
+  --offline-archive <file>           Install required packages from archive file
+
+Examples:
+  sudo ./clone_minimal.sh --bundle-deps-archive ./
+  sudo ./clone_minimal.sh --offline-archive ./adc-offline-pkgs-YYYYMMDD-HHMMSS.tar.gz
+  sudo ./clone_minimal.sh -v
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) show_help; exit 0 ;;
+    -v|--verbose) VERBOSE=yes; shift ;;
+    --offline) OFFLINE_MODE=yes; shift ;;
+    --offline-bundle)
+      [ "$#" -ge 2 ] || { echo "ERROR: --offline-bundle requires a directory path"; exit 1; }
+      OFFLINE_BUNDLE_DIR="$2"
+      OFFLINE_MODE=yes
+      shift 2
+      ;;
+    --offline-archive)
+      [ "$#" -ge 2 ] || { echo "ERROR: --offline-archive requires an archive path"; exit 1; }
+      OFFLINE_BUNDLE_ARCHIVE="$2"
+      OFFLINE_MODE=yes
+      shift 2
+      ;;
+    --bundle-deps)
+      [ "$#" -ge 2 ] || { echo "ERROR: --bundle-deps requires a directory path"; exit 1; }
+      BUNDLE_DEPS_DIR="$2"
+      shift 2
+      ;;
+    --bundle-deps-archive)
+      [ "$#" -ge 2 ] || { echo "ERROR: --bundle-deps-archive requires an archive path"; exit 1; }
+      BUNDLE_DEPS_ARCHIVE="$2"
+      shift 2
+      ;;
+    --self-test) SELF_TEST=yes; shift ;;
+    *)
+      echo "Unknown argument: $1"
+      echo "Usage: sudo ./clone_minimal.sh [-v|--verbose] [--offline] [--offline-bundle <dir>] [--offline-archive <file>] [--bundle-deps <dir>] [--bundle-deps-archive <file>] [--self-test]"
+      exit 1
+      ;;
   esac
 done
 diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
@@ -130,7 +194,7 @@ get_readahead() {
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
 # Self-test mode: validate environment and exit
-if [ "${1:-}" = "--self-test" ]; then
+if [ "$SELF_TEST" = "yes" ]; then
   echo "=== Self-test ==="
   # shellcheck disable=SC1091
   echo "OS: $(. /etc/os-release 2>/dev/null || true; echo "${NAME:-unknown}")"
@@ -155,6 +219,94 @@ echo "Checking prerequisites..."
 
 is_root() { [ "${EUID:-$(id -u)}" -eq 0 ]; }
 run_root() { if is_root; then "$@"; else sudo "$@"; fi }
+
+# If run via sudo, return created files to the invoking user.
+fix_owner_if_sudo() {
+  local target="$1"
+  if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+    chown -R "${SUDO_UID}:${SUDO_GID}" "$target" 2>/dev/null || true
+  fi
+}
+
+# All Ubuntu packages needed for this script.
+REQ_PACKAGES=(coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs pigz zstd)
+
+# Download prerequisite packages for offline usage and exit.
+bundle_prerequisites() {
+  local bundle_dir="$1"
+  if ! is_ubuntu; then
+    echo "ERROR: --bundle-deps is supported only on Ubuntu (apt)." >&2
+    exit 1
+  fi
+  mkdir -p "$bundle_dir/partial"
+  export DEBIAN_FRONTEND=noninteractive
+  echo "Preparing offline package bundle in: $bundle_dir"
+  run_root bash -lc 'cache_dir="$1"; shift; apt-get update -y && apt-get install -y --download-only --reinstall -o Dir::Cache::archives="$cache_dir" "$@"' _ "$bundle_dir" "${REQ_PACKAGES[@]}"
+  mapfile -t bundle_debs < <(ls "$bundle_dir"/*.deb 2>/dev/null || true)
+  if [ ${#bundle_debs[@]} -eq 0 ]; then
+    echo "ERROR: No .deb packages were downloaded into: $bundle_dir" >&2
+    echo "Try again on a machine with internet connectivity and valid Ubuntu apt sources." >&2
+    exit 1
+  fi
+  fix_owner_if_sudo "$bundle_dir"
+  echo "Bundle ready. Copy this folder to the offline machine and run:"
+  echo "  sudo ./clone_minimal.sh --offline-bundle \"$bundle_dir\""
+}
+
+# Build a single archive that contains all required .deb packages.
+bundle_prerequisites_archive() {
+  local archive_input="$1"
+  local archive_path="$archive_input"
+  local archive_dir=""
+  if [ -d "$archive_input" ] || [[ "$archive_input" == */ ]]; then
+    archive_dir="${archive_input%/}"
+    mkdir -p "$archive_dir"
+    archive_path="${archive_dir}/adc-offline-pkgs-$(date +%Y%m%d-%H%M%S).tar.gz"
+  else
+    archive_dir=$(dirname "$archive_path")
+    mkdir -p "$archive_dir"
+    if [[ "$archive_path" != *.tar.gz ]]; then
+      archive_path="${archive_path}.tar.gz"
+    fi
+  fi
+  local tmp_bundle
+  tmp_bundle=$(mktemp -d)
+  bundle_prerequisites "$tmp_bundle"
+  printf '%s\n' "${REQ_PACKAGES[@]}" > "$tmp_bundle/adc-required-packages.txt"
+  tar -czf "$archive_path" -C "$tmp_bundle" .
+  rm -rf "$tmp_bundle"
+  fix_owner_if_sudo "$archive_path"
+  echo "Offline package archive created: $archive_path"
+  echo "Use it on fresh/offline system with:"
+  echo "  sudo ./clone_minimal.sh --offline-archive \"$archive_path\""
+}
+
+# Extract archive into a temporary bundle directory.
+extract_bundle_archive() {
+  local archive_path="$1"
+  [ -f "$archive_path" ] || { echo "ERROR: Offline archive not found: $archive_path" >&2; exit 1; }
+  local tmp_bundle
+  tmp_bundle=$(mktemp -d)
+  tar -xf "$archive_path" -C "$tmp_bundle" || {
+    echo "ERROR: Could not extract offline archive: $archive_path" >&2
+    rm -rf "$tmp_bundle"
+    exit 1
+  }
+  echo "$tmp_bundle"
+}
+
+# Install packages using a preloaded .deb bundle, no network needed.
+install_from_bundle() {
+  local bundle_dir="$1"; shift
+  [ -d "$bundle_dir" ] || { echo "ERROR: Offline bundle directory not found: $bundle_dir" >&2; exit 1; }
+  mapfile -t debs < <(ls "$bundle_dir"/*.deb 2>/dev/null || true)
+  [ ${#debs[@]} -gt 0 ] || { echo "ERROR: No .deb packages found in: $bundle_dir" >&2; exit 1; }
+  echo "Installing packages from offline bundle: $bundle_dir"
+  run_root bash -lc 'cache_dir="$1"; shift; cp -f "$cache_dir"/*.deb /var/cache/apt/archives/ && apt-get install -y --no-download "$@"' _ "$bundle_dir" "$@" || {
+    echo "ERROR: Offline install failed. Ensure bundle has all dependencies." >&2
+    exit 1
+  }
+}
 
 # Read a strict yes/no answer (no default). Reprompts on empty or invalid input.
 read_yes_no() {
@@ -184,6 +336,17 @@ is_ubuntu() {
 }
 
 install_packages() {
+  if [ "$OFFLINE_MODE" = "yes" ]; then
+    if [ -z "$OFFLINE_BUNDLE_DIR" ] && [ -n "$OFFLINE_BUNDLE_ARCHIVE" ]; then
+      OFFLINE_BUNDLE_DIR=$(extract_bundle_archive "$OFFLINE_BUNDLE_ARCHIVE")
+    fi
+    if [ -z "$OFFLINE_BUNDLE_DIR" ]; then
+      echo "ERROR: Offline mode requires a package source. Use --offline-bundle <dir>, --offline-archive <file>, or ADC_DEB_BUNDLE." >&2
+      exit 1
+    fi
+    [ "$#" -gt 0 ] && install_from_bundle "$OFFLINE_BUNDLE_DIR" "$@"
+    return 0
+  fi
   if is_ubuntu; then
     if [ "$#" -gt 0 ]; then echo "Installing packages via apt: $*"; fi
     export DEBIAN_FRONTEND=noninteractive
@@ -192,6 +355,22 @@ install_packages() {
     echo "WARN: Auto-install is supported only on Ubuntu (apt). Skipping." >&2
   fi
 }
+
+if [ -n "$BUNDLE_DEPS_DIR" ]; then
+  bundle_prerequisites "$BUNDLE_DEPS_DIR"
+  exit 0
+fi
+
+if [ -n "$BUNDLE_DEPS_ARCHIVE" ]; then
+  bundle_prerequisites_archive "$BUNDLE_DEPS_ARCHIVE"
+  exit 0
+fi
+
+if [ "$OFFLINE_MODE" = "yes" ]; then
+  echo "Offline mode enabled."
+  [ -n "$OFFLINE_BUNDLE_DIR" ] && echo "Using package bundle: $OFFLINE_BUNDLE_DIR"
+  [ -n "$OFFLINE_BUNDLE_ARCHIVE" ] && echo "Using package archive: $OFFLINE_BUNDLE_ARCHIVE"
+fi
 
 # Ensure a set of commands exist; on Ubuntu, attempt to install their packages.
 ensure_commands() {
@@ -221,6 +400,7 @@ ensure_commands() {
     PKG_FOR_CMD[tune2fs]="e2fsprogs"
     PKG_FOR_CMD[e2fsck]="e2fsprogs"
     PKG_FOR_CMD[resize2fs]="e2fsprogs"
+    PKG_FOR_CMD[zstd]="zstd"
 
     # Build unique package list
     pkgs=()
