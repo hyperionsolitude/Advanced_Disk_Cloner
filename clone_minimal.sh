@@ -51,6 +51,7 @@ BUNDLE_DEPS_ARCHIVE=""
 BUILD_DEB_TARGET=""
 SELF_TEST=no
 UI_MODE="${ADC_UI:-0}"
+ORIGINAL_ARGS=("$@")
 
 show_help() {
   cat <<'EOF'
@@ -414,6 +415,10 @@ if [ "$SELF_TEST" = "yes" ]; then
 fi
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  # KDE/Cachy desktop launch support: re-exec with pkexec when no tty.
+  if ! [ -t 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v pkexec >/dev/null 2>&1; then
+    exec pkexec env ADC_UI="${UI_MODE}" bash "$(readlink -f "$0")" "${ORIGINAL_ARGS[@]}"
+  fi
   ui_error "This script must run as root. Please run: sudo ./clone_minimal.sh"
   exit 1
 fi
@@ -694,6 +699,17 @@ is_ubuntu() {
   return 1
 }
 
+is_arch_like() {
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    [ "${ID:-}" = "arch" ] && return 0
+    [ "${ID:-}" = "cachyos" ] && return 0
+    case ",${ID_LIKE:-}," in *,arch,*) return 0 ;; esac
+  fi
+  return 1
+}
+
 install_packages() {
   if [ "$OFFLINE_MODE" = "yes" ]; then
     if [ -z "$OFFLINE_BUNDLE_DIR" ] && [ -n "$OFFLINE_BUNDLE_ARCHIVE" ]; then
@@ -710,8 +726,11 @@ install_packages() {
     if [ "$#" -gt 0 ]; then echo "Installing packages via apt: $*"; fi
     export DEBIAN_FRONTEND=noninteractive
     run_root bash -lc 'apt-get update -y || true; apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"' _ "$@" || true
+  elif is_arch_like; then
+    if [ "$#" -gt 0 ]; then echo "Installing packages via pacman: $*"; fi
+    run_root pacman -Sy --noconfirm --needed "$@" || true
   else
-    echo "WARN: Auto-install is supported only on Ubuntu (apt). Skipping." >&2
+    echo "WARN: Auto-install is supported on Ubuntu (apt) and Arch-like (pacman). Skipping." >&2
   fi
 }
 
@@ -748,7 +767,7 @@ ensure_commands() {
     return 0
   fi
   if is_ubuntu; then
-    # Map commands → packages (Ubuntu)
+    # Map commands -> packages (Ubuntu)
     declare -A PKG_FOR_CMD
     PKG_FOR_CMD[dd]="coreutils"
     PKG_FOR_CMD[sfdisk]="util-linux"
@@ -791,9 +810,53 @@ ensure_commands() {
       echo "Please install the packages manually and re-run." >&2
       exit 1
     fi
+  elif is_arch_like; then
+    # Map commands -> packages (Arch/Cachy)
+    declare -A PKG_FOR_CMD
+    PKG_FOR_CMD[dd]="coreutils"
+    PKG_FOR_CMD[sfdisk]="util-linux"
+    PKG_FOR_CMD[lsblk]="util-linux"
+    PKG_FOR_CMD[gzip]="gzip"
+    PKG_FOR_CMD[pigz]="pigz"
+    PKG_FOR_CMD[tar]="tar"
+    PKG_FOR_CMD[pv]="pv"
+    PKG_FOR_CMD[gdisk]="gptfdisk"
+    PKG_FOR_CMD[sgdisk]="gptfdisk"
+    PKG_FOR_CMD[partclone.extfs]="partclone"
+    PKG_FOR_CMD[partclone.btrfs]="partclone"
+    PKG_FOR_CMD[ntfsclone]="ntfs-3g"
+    PKG_FOR_CMD[tune2fs]="e2fsprogs"
+    PKG_FOR_CMD[e2fsck]="e2fsprogs"
+    PKG_FOR_CMD[resize2fs]="e2fsprogs"
+    PKG_FOR_CMD[btrfs]="btrfs-progs"
+    PKG_FOR_CMD[zstd]="zstd"
+    PKG_FOR_CMD[awk]="gawk"
+
+    pkgs=()
+    for c in "${missing_cmds[@]}"; do
+      p="${PKG_FOR_CMD[$c]:-}"
+      if [ -n "$p" ]; then
+        case " ${pkgs[*]} " in *" $p "*) :;; *) pkgs+=("$p");; esac
+      fi
+    done
+    if [ ${#pkgs[@]} -gt 0 ]; then
+      install_packages "${pkgs[@]}"
+    fi
+
+    post_missing=()
+    for c in "$@"; do
+      if ! command -v "$c" >/dev/null 2>&1; then
+        post_missing+=("$c")
+      fi
+    done
+    if [ ${#post_missing[@]} -gt 0 ]; then
+      echo "ERROR: Missing required commands after pacman install attempt: ${post_missing[*]}" >&2
+      echo "Please install the packages manually and re-run." >&2
+      exit 1
+    fi
   else
-    echo "ERROR: Missing required commands on non-Ubuntu system: ${missing_cmds[*]}" >&2
-    echo "Please install: coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs" >&2
+    echo "ERROR: Missing required commands on unsupported distro: ${missing_cmds[*]}" >&2
+    echo "Please install manually and re-run." >&2
     exit 1
   fi
 }
