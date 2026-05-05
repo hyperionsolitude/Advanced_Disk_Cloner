@@ -381,7 +381,7 @@ if [ "$SELF_TEST" = "yes" ]; then
   echo "OS: $(. /etc/os-release 2>/dev/null || true; echo "${NAME:-unknown}")"
   echo "User: $(id -un) (EUID=${EUID:-$(id -u)})"
   echo "Checking commands..."
-  for cmd in dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs pigz; do
+  for cmd in dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs partclone.btrfs ntfsclone tune2fs e2fsck resize2fs btrfs pigz; do
     if command -v "$cmd" >/dev/null 2>&1; then
       echo " - $cmd: OK"
     else
@@ -416,7 +416,7 @@ fix_owner_if_sudo() {
 }
 
 # All Ubuntu packages needed for this script.
-REQ_PACKAGES=(coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs pigz zstd)
+REQ_PACKAGES=(coreutils util-linux gzip tar pv gdisk partclone ntfs-3g e2fsprogs btrfs-progs pigz zstd)
 # Extra packages for packaged app UX/runtime.
 APP_DEB_PACKAGES=(whiptail sudo bash)
 
@@ -741,10 +741,12 @@ ensure_commands() {
     PKG_FOR_CMD[gdisk]="gdisk"
     PKG_FOR_CMD[sgdisk]="gdisk"
     PKG_FOR_CMD[partclone.extfs]="partclone"
+    PKG_FOR_CMD[partclone.btrfs]="partclone"
     PKG_FOR_CMD[ntfsclone]="ntfs-3g"
     PKG_FOR_CMD[tune2fs]="e2fsprogs"
     PKG_FOR_CMD[e2fsck]="e2fsprogs"
     PKG_FOR_CMD[resize2fs]="e2fsprogs"
+    PKG_FOR_CMD[btrfs]="btrfs-progs"
     PKG_FOR_CMD[zstd]="zstd"
 
     # Build unique package list
@@ -780,7 +782,7 @@ ensure_commands() {
 # Always attempt to install prerequisites on Ubuntu (non-fatal)
 echo "Ensuring required commands are available..."
 # Core + feature commands needed by this script
-ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs pigz zstd
+ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs partclone.btrfs ntfsclone tune2fs e2fsck resize2fs btrfs pigz zstd
 
 # Ensure minimally required commands exist after best-effort install
 require dd
@@ -791,9 +793,14 @@ require tar
 # Report archive capabilities
 HAS_PARTCLONE=no
 HAS_NTFSCLONE=no
+HAS_PARTCLONE_BTRFS=no
 if command -v partclone.extfs >/dev/null 2>&1; then HAS_PARTCLONE=yes; fi
+if command -v partclone.btrfs >/dev/null 2>&1; then HAS_PARTCLONE_BTRFS=yes; fi
 if command -v ntfsclone >/dev/null 2>&1; then HAS_NTFSCLONE=yes; fi
-echo "Archive mode: used-block ext4=$HAS_PARTCLONE, ntfs=$HAS_NTFSCLONE (fallback to raw for others)"
+echo "Archive mode: used-block ext4=$HAS_PARTCLONE, btrfs=$HAS_PARTCLONE_BTRFS, ntfs=$HAS_NTFSCLONE (fallback to raw for others)"
+if [ "$HAS_PARTCLONE_BTRFS" = "no" ]; then
+  echo "WARN: partclone.btrfs is not available. Btrfs partitions will use raw mode (slower/larger archives)." >&2
+fi
 
 # Build numbered list of root disks: /dev/sd[a-z] and /dev/nvme*n1
 mapfile -t DISKS < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && ($1 ~ /^sd[a-z]+$/ || $1 ~ /^nvme[0-9]+n[0-9]+$/) {print $1}' | sort)
@@ -1179,7 +1186,7 @@ if [[ "$OP" =~ ^[Cc]$ ]]; then
   sync
 elif [[ "$OP" =~ ^[Aa]$ ]]; then
   # Archive: prefer used-block per-partition imaging into a tarball if tools available
-  if command -v partclone.extfs >/dev/null 2>&1 || command -v ntfsclone >/dev/null 2>&1; then
+  if command -v partclone.extfs >/dev/null 2>&1 || command -v partclone.btrfs >/dev/null 2>&1 || command -v ntfsclone >/dev/null 2>&1; then
     # Create a temporary workspace on the destination filesystem (not /tmp),
     # to avoid running out of space when root has low free space.
     ARCH_TAR="$ARCH"
@@ -1264,6 +1271,78 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
             fi
           else
             echo -e "$PNAME\text4\tdd" >> "$MANIFEST"
+            (
+              set +e -o pipefail
+    if command -v pv >/dev/null 2>&1; then
+      if command -v pigz >/dev/null 2>&1; then
+        ${IONICE:+$IONICE }dd if="$DEV" bs=16M status=none | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=16M status=none | pv | gzip -3 > "${OUTBASE}.raw.gz"
+      fi
+    else
+      if command -v pigz >/dev/null 2>&1; then
+        dd if="$DEV" bs=16M status=progress | pigz $PIGZ_ARGS > "${OUTBASE}.raw.gz"
+      else
+        dd if="$DEV" bs=16M status=progress | gzip -3 > "${OUTBASE}.raw.gz"
+      fi
+    fi
+            ); rc=$?
+            if [ $rc -eq 0 ] && [ -s "${OUTBASE}.raw.gz" ]; then
+              sz=$(stat -c %s "${OUTBASE}.raw.gz" 2>/dev/null || echo 0)
+              echo -e "$PNAME\tdd\tOK\t$sz" >> "$STATUS_LOG"
+              diag "[ARCH] Done: $PNAME via dd (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+            else
+              echo -e "$PNAME\tdd\tFAIL\t0" >> "$STATUS_LOG"
+              echo "[ARCH] FAIL: $PNAME via dd (rc=$rc)" >&2
+            fi
+          fi
+          ;;
+        btrfs)
+          # If partition is mounted (e.g., active root), avoid partclone and fallback to dd
+          MOUNTED_AT=$(findmnt -no TARGET "$DEV" 2>/dev/null || true)
+          if command -v partclone.btrfs >/dev/null 2>&1 && [ -z "$MOUNTED_AT" ]; then
+            echo -e "$PNAME\tbtrfs\tpartclone" >> "$MANIFEST"
+            (
+              set +e -o pipefail
+    if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+      if command -v pv >/dev/null 2>&1; then
+        { ${IONICE:+$IONICE }partclone.btrfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | ${IONICE:+$IONICE }pv | zstd -T${THREADS} -3 > "${OUTBASE}.pc.zst"
+      else
+        { partclone.btrfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | zstd -T${THREADS} -3 > "${OUTBASE}.pc.zst"
+      fi
+    else
+      if command -v pv >/dev/null 2>&1; then
+        if command -v pigz >/dev/null 2>&1; then
+          { ${IONICE:+$IONICE }partclone.btrfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | ${IONICE:+$IONICE }pv | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+        else
+          { partclone.btrfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | pv | gzip -3 > "${OUTBASE}.pc.gz"
+        fi
+      else
+        if command -v pigz >/dev/null 2>&1; then
+          { partclone.btrfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | pigz $PIGZ_ARGS > "${OUTBASE}.pc.gz"
+        else
+          { partclone.btrfs -c -s "$DEV" -o - 2>&1 1>&3 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; } } 3>&1 | gzip -3 > "${OUTBASE}.pc.gz"
+        fi
+      fi
+    fi
+            ); rc=$?
+            if [ $rc -eq 0 ]; then
+              if   [ -s "${OUTBASE}.pc.zst" ]; then OUTFILE="${OUTBASE}.pc.zst";
+              elif [ -s "${OUTBASE}.pc.gz"  ]; then OUTFILE="${OUTBASE}.pc.gz"; else OUTFILE=""; fi
+              if [ -n "$OUTFILE" ]; then
+                sz=$(stat -c %s "$OUTFILE" 2>/dev/null || echo 0)
+                echo -e "$PNAME\tpartclone\tOK\t$sz" >> "$STATUS_LOG"
+                diag "[ARCH] Done: $PNAME via partclone.btrfs (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
+              else
+                echo -e "$PNAME\tpartclone\tFAIL\t0" >> "$STATUS_LOG"
+                echo "[ARCH] FAIL: $PNAME via partclone.btrfs (no output detected)" >&2
+              fi
+            else
+              echo -e "$PNAME\tpartclone\tFAIL\t0" >> "$STATUS_LOG"
+              echo "[ARCH] FAIL: $PNAME via partclone.btrfs (rc=$rc)" >&2
+            fi
+          else
+            echo -e "$PNAME\tbtrfs\tdd" >> "$MANIFEST"
             (
               set +e -o pipefail
     if command -v pv >/dev/null 2>&1; then
@@ -1407,6 +1486,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     if [ "$VERBOSE" = "yes" ]; then sed -n '1,200p' "$STATUS_LOG" 2>/dev/null >&2 || true; fi
     # Cleanup handled by trap
     sync
+    fix_owner_if_sudo "$ARCH"
   else
     # Legacy full-disk raw archive
     sfdisk -d "$SRC" > "${ARCH%.gz}.sfdisk" 2>/dev/null || true
@@ -1420,6 +1500,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       fi
     fi
     sync
+    fix_owner_if_sudo "$ARCH"
   fi
 else
   # Restore from archive to target device
@@ -1571,7 +1652,7 @@ else
           for i in "${PART_INDEXES[@]}"; do
             if [ "$VERBOSE" = "yes" ]; then echo "[RESTORE][DIAG]  $i:${TYPE_BY_IDX[$i]:-?}:${SIZE_BY_IDX[$i]:-?}:${UUID_BY_IDX[$i]:-}" >&2; fi
           done
-          # Discover filesystems to allow enlargement prompts (ext4/ntfs only)
+          # Discover filesystems to allow enlargement prompts (ext4/ntfs/btrfs)
           declare -A FS_BY_IDX
           while IFS=$'\t' read -r PNAME FFS TOOL; do
             # extract numeric index from PNAME
@@ -1579,7 +1660,7 @@ else
             [ -n "$I" ] && FS_BY_IDX[$I]="$FFS"
           done < "$TMPDIR/manifest.tsv"
           # Optional enlargement inputs
-          ENQ=$(read_yes_no "Enlarge ext4/NTFS partitions before restore? (y/N): ")
+          ENQ=$(read_yes_no "Enlarge ext4/NTFS/Btrfs partitions before restore? (y/N): ")
           declare -A SIZE_NEW
           for i in "${PART_INDEXES[@]}"; do SIZE_NEW[$i]="${SIZE_BY_IDX[$i]}"; done
           if [[ "$ENQ" =~ ^[Yy]$ ]]; then
@@ -1593,7 +1674,7 @@ else
             } >&2
             for i in "${PART_INDEXES[@]}"; do
               fs="${FS_BY_IDX[$i]:-}"
-              if [ "$fs" = "ext4" ] || [ "$fs" = "ntfs" ]; then
+              if [ "$fs" = "ext4" ] || [ "$fs" = "ntfs" ] || [ "$fs" = "btrfs" ]; then
                 cur="${SIZE_NEW[$i]}"
                 cur_h=$(numfmt --to=iec $((cur*SECTOR_SIZE)) 2>/dev/null || echo "$cur sectors")
                 free_h=$(numfmt --to=iec $((FREE*SECTOR_SIZE)) 2>/dev/null || echo "$FREE sectors")
@@ -1749,8 +1830,22 @@ else
         BASE="$TMPDIR/part-${PNAME}"
         case "$TOOL" in
           partclone)
-            if [ -f "${BASE}.pc.gz" ] && command -v partclone.extfs >/dev/null 2>&1; then
-              if command -v pigz >/dev/null 2>&1; then
+            if [ "$FSTOOL" = "btrfs" ]; then
+              if { [ -f "${BASE}.pc.gz" ] || [ -f "${BASE}.pc.zst" ]; } && command -v partclone.btrfs >/dev/null 2>&1; then
+                if [ -f "${BASE}.pc.zst" ] && command -v zstd >/dev/null 2>&1; then
+                  zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.btrfs -r -o "$TDEV" -s -
+                elif command -v pigz >/dev/null 2>&1; then
+                  pigz -dc "${BASE}.pc.gz" | partclone.btrfs -r -o "$TDEV" -s -
+                else
+                  gzip -dc "${BASE}.pc.gz" | partclone.btrfs -r -o "$TDEV" -s -
+                fi
+              else
+                echo "WARN: missing partclone.btrfs image or tool for $PNAME"
+              fi
+            elif { [ -f "${BASE}.pc.gz" ] || [ -f "${BASE}.pc.zst" ]; } && command -v partclone.extfs >/dev/null 2>&1; then
+              if [ -f "${BASE}.pc.zst" ] && command -v zstd >/dev/null 2>&1; then
+                zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.extfs -r -o "$TDEV" -s -
+              elif command -v pigz >/dev/null 2>&1; then
                 pigz -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
               else
                 gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
@@ -1881,11 +1976,21 @@ else
           BASE="$TMPDIR/part-${PNAME}"
           case "$TOOL" in
             partclone)
-            if [ -f "${BASE}.pc.${PART_EXT}" ] && command -v partclone.extfs >/dev/null 2>&1; then
-              if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
-                zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.extfs -r -o "$TDEV" -s -
+            if [ -f "${BASE}.pc.${PART_EXT}" ]; then
+              if [ "$FSTOOL" = "btrfs" ] && command -v partclone.btrfs >/dev/null 2>&1; then
+                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                  zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.btrfs -r -o "$TDEV" -s -
+                else
+                  gzip -dc "${BASE}.pc.gz" | partclone.btrfs -r -o "$TDEV" -s -
+                fi
+              elif command -v partclone.extfs >/dev/null 2>&1; then
+                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                  zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.extfs -r -o "$TDEV" -s -
+                else
+                  gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+                fi
               else
-                gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
+                echo "WARN: missing partclone restore tool for $PNAME"
               fi
               else
                 echo "WARN: missing partclone image or tool for $PNAME"
@@ -2028,7 +2133,7 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
       LAST_PART="/dev/${LAST_PART_NAME}"
       FSTYPE_LAST=$(lsblk -no FSTYPE "$LAST_PART" 2>/dev/null || true)
       # Only attempt if filesystem appears growable
-      if [ "$FSTYPE_LAST" = "ext4" ] || [ "$FSTYPE_LAST" = "ntfs" ]; then
+      if [ "$FSTYPE_LAST" = "ext4" ] || [ "$FSTYPE_LAST" = "ntfs" ] || [ "$FSTYPE_LAST" = "btrfs" ]; then
         # Compute current and possible max sizes
         SECTOR_SIZE=$(blockdev --getss "$DST")
         DISK_SECTORS=$(blockdev --getsz "$DST")
@@ -2069,6 +2174,21 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
                   else
                     echo "ntfsresize not available; skipped filesystem grow."
                   fi
+                elif [ "$FSTYPE_LAST" = "btrfs" ]; then
+                  if command -v btrfs >/dev/null 2>&1; then
+                    TMP_MNT=$(mktemp -d)
+                    if mount "$LAST_PART" "$TMP_MNT" 2>/dev/null; then
+                      btrfs filesystem resize max "$TMP_MNT" || true
+                      umount "$TMP_MNT" 2>/dev/null || true
+                      rmdir "$TMP_MNT" 2>/dev/null || true
+                      echo "Btrfs filesystem grown."
+                    else
+                      rmdir "$TMP_MNT" 2>/dev/null || true
+                      echo "Could not mount $LAST_PART for btrfs resize; skipped filesystem grow."
+                    fi
+                  else
+                    echo "btrfs tool not available; skipped filesystem grow."
+                  fi
                 fi
               else
                 echo "WARN: Could not determine partition index for $LAST_PART; skipping enlarge."
@@ -2080,26 +2200,47 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
     fi
   fi
 
-  # Optional: fix low space on Linux root by growing ext4 to full partition and lowering reserved blocks
+  # Optional: fix low space on Linux root by growing ext4/btrfs to full partition.
   if [ "${PARTIAL_RESTORE:-no}" != "yes" ]; then
-    GROW=$(read_yes_no "Grow ext4 filesystem on TARGET to fill its partition and set reserved to 1%? (y/N): ")
+    GROW=$(read_yes_no "Grow ext4/btrfs filesystem on TARGET to fill its partition? (y/N): ")
     if [[ "$GROW" =~ ^[Yy]$ ]]; then
-    # Auto-detect single ext4 partition on target
-    mapfile -t TGT_EXT4 < <(lsblk -ln -o NAME,FSTYPE "$DST" | awk '$2=="ext4" {print $1}')
-    if [ ${#TGT_EXT4[@]} -eq 1 ]; then
-      TP="/dev/${TGT_EXT4[0]}"
-      echo "=== Growing $TP to fill its partition and reducing reserved blocks ==="
+    # Auto-detect a single ext4 or btrfs partition on target
+    mapfile -t TGT_GROWABLE < <(lsblk -ln -o NAME,FSTYPE "$DST" | awk '$2=="ext4" || $2=="btrfs" {print $1"\t"$2}')
+    if [ ${#TGT_GROWABLE[@]} -eq 1 ]; then
+      TP_NAME=$(echo -e "${TGT_GROWABLE[0]}" | awk -F'\t' '{print $1}')
+      TP_FS=$(echo -e "${TGT_GROWABLE[0]}" | awk -F'\t' '{print $2}')
+      TP="/dev/${TP_NAME}"
+      echo "=== Growing $TP (fs=$TP_FS) to fill its partition ==="
       mount | awk -v p="$TP" '$1 == p {print $3}' | xargs -r -n1 umount || true
-      if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
-        e2fsck -f "$TP" || true
-        resize2fs "$TP" || true
-        tune2fs -m 1 "$TP" || true
-        echo "Done."
+      if [ "$TP_FS" = "ext4" ]; then
+        if command -v e2fsck >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
+          e2fsck -f "$TP" || true
+          resize2fs "$TP" || true
+          tune2fs -m 1 "$TP" || true
+          echo "Ext4 grow done."
+        else
+          echo "e2fsck/resize2fs not available; skipping ext4 grow."
+        fi
+      elif [ "$TP_FS" = "btrfs" ]; then
+        if command -v btrfs >/dev/null 2>&1; then
+          TMP_MNT=$(mktemp -d)
+          if mount "$TP" "$TMP_MNT" 2>/dev/null; then
+            btrfs filesystem resize max "$TMP_MNT" || true
+            umount "$TMP_MNT" 2>/dev/null || true
+            rmdir "$TMP_MNT" 2>/dev/null || true
+            echo "Btrfs grow done."
+          else
+            rmdir "$TMP_MNT" 2>/dev/null || true
+            echo "Could not mount $TP for btrfs resize."
+          fi
+        else
+          echo "btrfs tool not available; skipping btrfs grow."
+        fi
       else
-        echo "e2fsck/resize2fs not available; skipping grow."
+        echo "Unsupported filesystem for grow: $TP_FS"
       fi
     else
-      echo "Skip grow: ext4 auto-detect ambiguous or none found on target (${#TGT_EXT4[@]} candidates)."
+      echo "Skip grow: ext4/btrfs auto-detect ambiguous or none found on target (${#TGT_GROWABLE[@]} candidates)."
     fi
     fi
   fi
