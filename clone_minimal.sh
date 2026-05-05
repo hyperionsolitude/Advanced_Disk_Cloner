@@ -346,6 +346,25 @@ get_device_size_bytes() {
   return 1
 }
 
+grow_btrfs_partition() {
+  local dev="$1"
+  command -v btrfs >/dev/null 2>&1 || { echo "btrfs tool not available; skipped filesystem grow."; return 1; }
+  local tmp_mnt
+  tmp_mnt=$(mktemp -d)
+  # Try common mount variants for restored systems.
+  if mount "$dev" "$tmp_mnt" 2>/dev/null || \
+     mount -o rw "$dev" "$tmp_mnt" 2>/dev/null || \
+     mount -o rw,subvolid=5 "$dev" "$tmp_mnt" 2>/dev/null; then
+    btrfs filesystem resize max "$tmp_mnt" || true
+    umount "$tmp_mnt" 2>/dev/null || true
+    rmdir "$tmp_mnt" 2>/dev/null || true
+    return 0
+  fi
+  rmdir "$tmp_mnt" 2>/dev/null || true
+  echo "Could not mount $dev for btrfs resize; skipped filesystem grow."
+  return 1
+}
+
 # List mounted partitions that belong to real disks (sdX / nvme*n1).
 # Output format: "<partition_name>\t<mountpoint>"
 list_mounted_real_partitions() {
@@ -782,7 +801,7 @@ ensure_commands() {
 # Always attempt to install prerequisites on Ubuntu (non-fatal)
 echo "Ensuring required commands are available..."
 # Core + feature commands needed by this script
-ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs partclone.btrfs ntfsclone tune2fs e2fsck resize2fs btrfs pigz zstd
+ensure_commands dd sfdisk gzip tar lsblk awk pv gdisk partclone.extfs ntfsclone tune2fs e2fsck resize2fs pigz zstd
 
 # Ensure minimally required commands exist after best-effort install
 require dd
@@ -1855,8 +1874,10 @@ else
             fi
             ;;
           ntfsclone)
-            if [ -f "${BASE}.ntfs.gz" ] && command -v ntfsclone >/dev/null 2>&1; then
-              if command -v pigz >/dev/null 2>&1; then
+            if { [ -f "${BASE}.ntfs.gz" ] || [ -f "${BASE}.ntfs.zst" ]; } && command -v ntfsclone >/dev/null 2>&1; then
+              if [ -f "${BASE}.ntfs.zst" ] && command -v zstd >/dev/null 2>&1; then
+                zstd -dc -T${THREADS} "${BASE}.ntfs.zst" | ntfsclone --restore-image --overwrite "$TDEV" -
+              elif command -v pigz >/dev/null 2>&1; then
                 pigz -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
               else
                 gzip -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
@@ -1976,15 +1997,15 @@ else
           BASE="$TMPDIR/part-${PNAME}"
           case "$TOOL" in
             partclone)
-            if [ -f "${BASE}.pc.${PART_EXT}" ]; then
+            if [ -f "${BASE}.pc.zst" ] || [ -f "${BASE}.pc.gz" ]; then
               if [ "$FSTOOL" = "btrfs" ] && command -v partclone.btrfs >/dev/null 2>&1; then
-                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                if [ -f "${BASE}.pc.zst" ] && command -v zstd >/dev/null 2>&1; then
                   zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.btrfs -r -o "$TDEV" -s -
                 else
                   gzip -dc "${BASE}.pc.gz" | partclone.btrfs -r -o "$TDEV" -s -
                 fi
               elif command -v partclone.extfs >/dev/null 2>&1; then
-                if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+                if [ -f "${BASE}.pc.zst" ] && command -v zstd >/dev/null 2>&1; then
                   zstd -dc -T${THREADS} "${BASE}.pc.zst" | partclone.extfs -r -o "$TDEV" -s -
                 else
                   gzip -dc "${BASE}.pc.gz" | partclone.extfs -r -o "$TDEV" -s -
@@ -1997,8 +2018,8 @@ else
               fi
               ;;
             ntfsclone)
-            if [ -f "${BASE}.ntfs.${PART_EXT}" ] && command -v ntfsclone >/dev/null 2>&1; then
-              if [ "$PART_EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+            if { [ -f "${BASE}.ntfs.zst" ] || [ -f "${BASE}.ntfs.gz" ]; } && command -v ntfsclone >/dev/null 2>&1; then
+              if [ -f "${BASE}.ntfs.zst" ] && command -v zstd >/dev/null 2>&1; then
                 zstd -dc -T${THREADS} "${BASE}.ntfs.zst" | ntfsclone --restore-image --overwrite "$TDEV" -
               else
                 gzip -dc "${BASE}.ntfs.gz" | ntfsclone --restore-image --overwrite "$TDEV" -
@@ -2175,19 +2196,8 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
                     echo "ntfsresize not available; skipped filesystem grow."
                   fi
                 elif [ "$FSTYPE_LAST" = "btrfs" ]; then
-                  if command -v btrfs >/dev/null 2>&1; then
-                    TMP_MNT=$(mktemp -d)
-                    if mount "$LAST_PART" "$TMP_MNT" 2>/dev/null; then
-                      btrfs filesystem resize max "$TMP_MNT" || true
-                      umount "$TMP_MNT" 2>/dev/null || true
-                      rmdir "$TMP_MNT" 2>/dev/null || true
-                      echo "Btrfs filesystem grown."
-                    else
-                      rmdir "$TMP_MNT" 2>/dev/null || true
-                      echo "Could not mount $LAST_PART for btrfs resize; skipped filesystem grow."
-                    fi
-                  else
-                    echo "btrfs tool not available; skipped filesystem grow."
+                  if grow_btrfs_partition "$LAST_PART"; then
+                    echo "Btrfs filesystem grown."
                   fi
                 fi
               else
@@ -2222,19 +2232,8 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
           echo "e2fsck/resize2fs not available; skipping ext4 grow."
         fi
       elif [ "$TP_FS" = "btrfs" ]; then
-        if command -v btrfs >/dev/null 2>&1; then
-          TMP_MNT=$(mktemp -d)
-          if mount "$TP" "$TMP_MNT" 2>/dev/null; then
-            btrfs filesystem resize max "$TMP_MNT" || true
-            umount "$TMP_MNT" 2>/dev/null || true
-            rmdir "$TMP_MNT" 2>/dev/null || true
-            echo "Btrfs grow done."
-          else
-            rmdir "$TMP_MNT" 2>/dev/null || true
-            echo "Could not mount $TP for btrfs resize."
-          fi
-        else
-          echo "btrfs tool not available; skipping btrfs grow."
+        if grow_btrfs_partition "$TP"; then
+          echo "Btrfs grow done."
         fi
       else
         echo "Unsupported filesystem for grow: $TP_FS"
