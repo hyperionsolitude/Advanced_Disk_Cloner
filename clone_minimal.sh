@@ -317,8 +317,9 @@ get_readahead() {
 # List mounted partitions that belong to real disks (sdX / nvme*n1).
 # Output format: "<partition_name>\t<mountpoint>"
 list_mounted_real_partitions() {
-  local src tgt pk pkdev
-  while IFS=$'\t' read -r src tgt; do
+  local src tgt pk pkdev found
+  found=0
+  while read -r src tgt; do
     [[ "$src" == /dev/* ]] || continue
     [ -b "$src" ] || continue
     pk=$(lsblk -no PKNAME "$src" 2>/dev/null || true)
@@ -329,7 +330,14 @@ list_mounted_real_partitions() {
     pkdev="/dev/$pk"
     [ -b "$pkdev" ] || continue
     printf '%s\t%s\n' "$(basename "$src")" "$tgt"
-  done < <(findmnt -rn -o SOURCE,TARGET 2>/dev/null || true)
+    found=1
+  done < <(findmnt -rn --raw -o SOURCE,TARGET 2>/dev/null || true)
+
+  # Fallback path: if findmnt yielded nothing, use lsblk discovery.
+  if [ "$found" -eq 0 ]; then
+    lsblk -ln -o NAME,TYPE,MOUNTPOINT,PKNAME 2>/dev/null | \
+      awk '$2=="part" && $3!="" && ($4 ~ /^sd[a-z]+$/ || $4 ~ /^nvme[0-9]+n[0-9]+$/) {print $1"\t"$3}'
+  fi
 }
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
