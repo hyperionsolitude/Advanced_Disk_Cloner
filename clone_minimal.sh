@@ -314,6 +314,38 @@ get_readahead() {
   if [ -r "$ra_file" ]; then cat "$ra_file" 2>/dev/null || true; fi
 }
 
+get_device_size_bytes() {
+  local dev="$1"
+  local size=""
+
+  # Preferred method
+  size=$(blockdev --getsize64 "$dev" 2>/dev/null || true)
+  if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+    echo "$size"
+    return 0
+  fi
+
+  # Fallback 1: lsblk byte size
+  size=$(lsblk -bdno SIZE "$dev" 2>/dev/null || true)
+  if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+    echo "$size"
+    return 0
+  fi
+
+  # Fallback 2: sysfs sectors * 512
+  local bname sectors_file sectors
+  bname=$(basename "$dev")
+  sectors_file="/sys/class/block/${bname}/size"
+  sectors=$(cat "$sectors_file" 2>/dev/null || true)
+  if [[ "$sectors" =~ ^[0-9]+$ ]] && [ "$sectors" -gt 0 ]; then
+    echo $((sectors * 512))
+    return 0
+  fi
+
+  echo "0"
+  return 1
+}
+
 # List mounted partitions that belong to real disks (sdX / nvme*n1).
 # Output format: "<partition_name>\t<mountpoint>"
 list_mounted_real_partitions() {
@@ -360,6 +392,11 @@ if [ "$SELF_TEST" = "yes" ]; then
   lsblk -dn -o NAME,TYPE,SIZE,MODEL || true
   echo "=== Self-test done ==="
   exit 0
+fi
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  ui_error "This script must run as root. Please run: sudo ./clone_minimal.sh"
+  exit 1
 fi
 
 # --- Auto-install prerequisites (best effort) ---
@@ -1069,15 +1106,15 @@ for line in "${PARTS2[@]}"; do
 done
 
 # Get device sizes with error checking
-SRC_BYTES=$(blockdev --getsize64 "$SRC" 2>/dev/null || echo "0")
+SRC_BYTES=$(get_device_size_bytes "$SRC")
 if [[ ! "$SRC_BYTES" =~ ^[0-9]+$ ]] || [ "$SRC_BYTES" -eq 0 ]; then
-  ui_error "Could not determine source device size: $SRC"
+  ui_error "Could not determine source device size: $SRC (check root permissions and device availability)"
   exit 1
 fi
 if [[ "$OP" =~ ^[Cc]$ ]]; then
-  DST_BYTES=$(blockdev --getsize64 "$DST" 2>/dev/null || echo "0")
+  DST_BYTES=$(get_device_size_bytes "$DST")
   if [[ ! "$DST_BYTES" =~ ^[0-9]+$ ]] || [ "$DST_BYTES" -eq 0 ]; then
-    ui_error "Could not determine target device size: $DST"
+    ui_error "Could not determine target device size: $DST (check root permissions and device availability)"
     exit 1
   fi
 else
