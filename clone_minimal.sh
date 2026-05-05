@@ -314,6 +314,24 @@ get_readahead() {
   if [ -r "$ra_file" ]; then cat "$ra_file" 2>/dev/null || true; fi
 }
 
+# List mounted partitions that belong to real disks (sdX / nvme*n1).
+# Output format: "<partition_name>\t<mountpoint>"
+list_mounted_real_partitions() {
+  local src tgt pk pkdev
+  while IFS=$'\t' read -r src tgt; do
+    [[ "$src" == /dev/* ]] || continue
+    [ -b "$src" ] || continue
+    pk=$(lsblk -no PKNAME "$src" 2>/dev/null || true)
+    case "$pk" in
+      sd[a-z]*|nvme[0-9]*n[0-9]*) ;;
+      *) continue ;;
+    esac
+    pkdev="/dev/$pk"
+    [ -b "$pkdev" ] || continue
+    printf '%s\t%s\n' "$(basename "$src")" "$tgt"
+  done < <(findmnt -rn -o SOURCE,TARGET 2>/dev/null || true)
+}
+
 require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 
 # Self-test mode: validate environment and exit
@@ -841,16 +859,14 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   # Choose destination drive (mounted) and path for archive
   SRC_BASENAME=$(basename "$SRC")
   echo "=== Choose drive to SAVE the archive on ==="
-  # Collect mounted destinations on real disks only (exclude loop devices)
-  # Use entries where TYPE=part, MOUNTPOINT != empty, and parent disk PKNAME is sdX or nvme*n1
-  mapfile -t MOUNTED < <(lsblk -ln -o NAME,TYPE,MOUNTPOINT,PKNAME | \
-    awk '$2=="part" && $3!="" && ($4 ~ /^sd[a-z]+$/ || $4 ~ /^nvme[0-9]+n[0-9]+$/) {print $1" "$3}' | sort -k2,2 -u)
+  # Collect mounted destinations on real disks only (exclude loop/ram media)
+  mapfile -t MOUNTED < <(list_mounted_real_partitions | sort -t$'\t' -k2,2 -u)
   if [ ${#MOUNTED[@]} -eq 0 ]; then
     echo "No mounted destinations found. Please mount a drive and retry."; exit 1
   fi
   for i in "${!MOUNTED[@]}"; do
-    DN=$(echo "${MOUNTED[$i]}" | awk '{print $1}')
-    MP=$(echo "${MOUNTED[$i]}" | awk '{print $2}')
+    DN=$(echo -e "${MOUNTED[$i]}" | awk -F'\t' '{print $1}')
+    MP=$(echo -e "${MOUNTED[$i]}" | awk -F'\t' '{print $2}')
     FREE=$(df -hP "$MP" 2>/dev/null | awk 'NR==2{print $4}')
     echo "[$((i+1))] /dev/$DN mounted at $MP  free=$FREE"
   done
@@ -859,7 +875,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   if [[ "$DSTSAVE_IDX" =~ ^[0-9]+$ ]]; then
     DSTSAVE_IDX=$((DSTSAVE_IDX-1))
     if [ "$DSTSAVE_IDX" -lt 0 ] || [ "$DSTSAVE_IDX" -ge ${#MOUNTED[@]} ]; then echo "ERROR: selection out of range"; exit 1; fi
-    ARCH_DIR=$(echo "${MOUNTED[$DSTSAVE_IDX]}" | awk '{print $2}')
+    ARCH_DIR=$(echo -e "${MOUNTED[$DSTSAVE_IDX]}" | awk -F'\t' '{print $2}')
   else
     # Enable readline so TAB completes filesystem paths
     read -e -p "Enter a directory path to save the archive (must exist): " ARCH_DIR
@@ -940,9 +956,7 @@ elif [[ "$OP" =~ ^[Rr]$ ]]; then
   done
   if [ ! -f "$ARCH" ]; then
     # If a relative path was provided, try resolving against mounted real-disk destinations
-    # Collect mounted destinations where TYPE=part, parent PKNAME is sdX or nvme*n1
-    mapfile -t MOUNTED_MP < <(lsblk -ln -o NAME,TYPE,MOUNTPOINT,PKNAME | \
-      awk '$2=="part" && $3!="" && ($4 ~ /^sd[a-z]+$/ || $4 ~ /^nvme[0-9]+n[0-9]+$/) {print $3}' | sort -u)
+    mapfile -t MOUNTED_MP < <(list_mounted_real_partitions | awk -F'\t' '{print $2}' | sort -u)
     RESOLVED=""
     for mp in "${MOUNTED_MP[@]}"; do
       # Try as provided relative under mountpoint
