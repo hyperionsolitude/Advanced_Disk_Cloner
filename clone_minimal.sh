@@ -2020,10 +2020,18 @@ else
     # Legacy full-disk raw archive
     if [ "$ARCH_FORMAT" = "raw_compressed" ] || [ "$ARCH_FORMAT" = "gz" ] || [ "$ARCH_FORMAT" = "zst" ]; then
       T_CMD=""
-      if [[ "$ARCH" == *.zst ]] || [ "$ARCH_FORMAT" = "zst" ]; then
+      if [ "$ARCH_FORMAT" = "zst" ] || [[ "$ARCH" == *.zst ]]; then
         T_CMD="zstd -dc -T${THREADS}"
-      elif [[ "$ARCH" == *.gz ]] || [ "$ARCH_FORMAT" = "gz" ]; then
+      elif [ "$ARCH_FORMAT" = "gz" ] || [[ "$ARCH" == *.gz ]]; then
         T_CMD=$(command -v pigz >/dev/null 2>&1 && echo "pigz -dc -p ${THREADS}" || echo "gzip -dc")
+      elif [ "$ARCH_FORMAT" = "raw_compressed" ]; then
+        # Re-detect actual compression for raw images since extension is unreliable
+        FILE_TYPE=$(file -b "$ARCH" 2>/dev/null || echo "unknown")
+        if [[ "$FILE_TYPE" == *"zstd"* ]]; then
+          T_CMD="zstd -dc -T${THREADS}"
+        elif [[ "$FILE_TYPE" == *"gzip"* ]]; then
+          T_CMD=$(command -v pigz >/dev/null 2>&1 && echo "pigz -dc -p ${THREADS}" || echo "gzip -dc")
+        fi
       fi
 
       if [ -n "$T_CMD" ]; then
