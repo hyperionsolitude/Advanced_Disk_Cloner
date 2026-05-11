@@ -2016,13 +2016,30 @@ else
     echo "[RESTORE] Restore completed successfully." >&2
   else
     # Legacy full-disk raw archive
-    if command -v pigz >/dev/null 2>&1; then
-      pigz -dc "$ARCH" | dd of="$DST" bs=1M conv=fsync
-    else
-      if command -v pv >/dev/null 2>&1; then
-        pv "$ARCH" | gzip -dc | dd of="$DST" bs=1M conv=fsync
+    if [ "$ARCH_FORMAT" = "raw_compressed" ] || [ "$ARCH_FORMAT" = "gz" ] || [ "$ARCH_FORMAT" = "zst" ]; then
+      T_CMD=""
+      if [[ "$ARCH" == *.zst ]] || [ "$ARCH_FORMAT" = "zst" ]; then
+        T_CMD="zstd -dc -T${THREADS}"
+      elif [[ "$ARCH" == *.gz ]] || [ "$ARCH_FORMAT" = "gz" ]; then
+        T_CMD=$(command -v pigz >/dev/null 2>&1 && echo "pigz -dc -p ${THREADS}" || echo "gzip -dc")
+      fi
+
+      if [ -n "$T_CMD" ]; then
+        if command -v pv >/dev/null 2>&1; then
+          $T_CMD "$ARCH" | pv | dd of="$DST" bs=1M conv=fsync status=none
+        else
+          $T_CMD "$ARCH" | dd of="$DST" bs=1M conv=fsync status=progress
+        fi
       else
-        gzip -dc "$ARCH" | dd of="$DST" bs=1M status=progress conv=fsync
+        ui_error "Could not determine decompression tool for raw image: $ARCH"
+        exit 1
+      fi
+    else
+      # Truly raw (uncompressed)
+      if command -v pv >/dev/null 2>&1; then
+        pv "$ARCH" | dd of="$DST" bs=1M conv=fsync status=none
+      else
+        dd if="$ARCH" of="$DST" bs=1M status=progress conv=fsync
       fi
     fi
     echo "[RESTORE] Restore completed successfully." >&2
