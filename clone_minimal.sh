@@ -1017,8 +1017,8 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   [ -d "$ARCH_DIR" ] || { echo "Archive directory does not exist: $ARCH_DIR"; exit 1; }
   # Ask for file name or a path within the chosen destination (absolute path also accepted)
   # Enable readline with filename completion and prefill with chosen destination directory
-  DEF_ARCH_PATH="${ARCH_DIR%/}/${SRC_BASENAME}.img.gz"
-  read -e -p "Enter archive file name or path [default ${SRC_BASENAME}.img.gz]: " -i "$DEF_ARCH_PATH" ARCH_INPUT
+  DEF_ARCH_PATH="${ARCH_DIR%/}/${SRC_BASENAME}.img.${PART_EXT}"
+  read -e -p "Enter archive file name or path [default ${SRC_BASENAME}.img.${PART_EXT}]: " -i "$DEF_ARCH_PATH" ARCH_INPUT
   ARCH_INPUT=${ARCH_INPUT:-$DEF_ARCH_PATH}
   # If user provided a relative path like ./ or ./file, resolve relative to the chosen destination directory
   if [ -n "$ARCH_DIR" ]; then
@@ -1040,20 +1040,20 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   # If user provided a directory (ends with / or exists as a directory), use default filename inside it
   if [[ "$ARCH_INPUT" == */ ]] || [ -d "$ARCH" ]; then
     ARCH_DIRNAME="${ARCH%/}"
-    ARCH_BASE="${SRC_BASENAME}.img.gz"
+    ARCH_BASE="${SRC_BASENAME}.img.${PART_EXT}"
     ARCH="$ARCH_DIRNAME/$ARCH_BASE"
   else
     # Auto-append extension when missing on the basename
     ARCH_DIRNAME=$(dirname "$ARCH")
     ARCH_BASE=$(basename "$ARCH")
     if [[ -n "$ARCH_BASE" ]]; then
-      if [[ "$ARCH_BASE" != *.gz ]]; then
+      if [[ "$ARCH_BASE" != *.${PART_EXT} ]]; then
         if [[ "$ARCH_BASE" == *.img ]]; then
-          ARCH_BASE="${ARCH_BASE}.gz"
+          ARCH_BASE="${ARCH_BASE}.${PART_EXT}"
         else
-          # If no dot in basename, append full .img.gz; otherwise leave as provided
+          # If no dot in basename, append full .img.${PART_EXT}; otherwise leave as provided
           if [[ "$ARCH_BASE" != *.* ]]; then
-            ARCH_BASE="${ARCH_BASE}.img.gz"
+            ARCH_BASE="${ARCH_BASE}.img.${PART_EXT}"
           fi
         fi
       fi
@@ -1566,8 +1566,10 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     fix_owner_if_sudo "$ARCH"
   else
     # Legacy full-disk raw archive
-    sfdisk -d "$SRC" > "${ARCH%.gz}.sfdisk" 2>/dev/null || true
-    if command -v pigz >/dev/null 2>&1; then
+    sfdisk -d "$SRC" > "${ARCH%.${PART_EXT}}.sfdisk" 2>/dev/null || true
+    if [ "$HAS_ZSTD" = "yes" ]; then
+      ${IONICE:+$IONICE }dd if="$SRC" bs=1M conv=noerror,sync | zstd -T${THREADS} -3 > "$ARCH"
+    elif command -v pigz >/dev/null 2>&1; then
       ${IONICE:+$IONICE }dd if="$SRC" bs=1M conv=noerror,sync | pigz -1 > "$ARCH"
     else
       if command -v pv >/dev/null 2>&1; then
