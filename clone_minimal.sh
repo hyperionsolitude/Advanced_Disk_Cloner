@@ -1069,18 +1069,13 @@ elif [[ "$OP" =~ ^[Rr]$ ]]; then
   # Compute a sensible default base for TAB completion: if SOURCE has a mounted partition,
   # prefill the prompt with that mountpoint so TAB lists files from there.
   SRC_BN=$(basename -- "$SRC")
-  SRC_BASE_MP=$(lsblk -ln -o NAME,MOUNTPOINT,PKNAME "$SRC" | awk '$2!="" {print $2; exit}')
   DEF_BASE="./"
-  if [ -n "$SRC_BASE_MP" ]; then DEF_BASE="${SRC_BASE_MP%/}/"; fi
   read -e -i "$DEF_BASE" -p "Enter archive image file to restore (e.g., ./sdb.img.gz): " ARCH
-  # If user provided a relative path like ./ or ./file, resolve relative to the SOURCE's mounted partition (if any)
-  if [ -n "$SRC_BASE_MP" ]; then
-    if [ "$ARCH" = "./" ] || [ "$ARCH" = "." ]; then
-      ARCH="${SRC_BASE_MP%/}/"
-    elif [[ "$ARCH" != /* ]]; then
-      # Relative path => anchor to the source disk's mountpoint
-      ARCH="${SRC_BASE_MP%/}/${ARCH#./}"
-    fi
+  # If user provided a relative path like ./ or ./file, resolve relative to the current working directory
+  if [[ "$ARCH" = "./" ]] || [[ "$ARCH" = "." ]]; then
+    ARCH="${PWD%/}/"
+  elif [[ "$ARCH" != /* ]]; then
+    ARCH="${PWD%/}/${ARCH#./}"
   fi
   # If a directory is provided, allow selecting a file within it (TAB completes)
   while [ -d "$ARCH" ]; do
@@ -1625,9 +1620,20 @@ else
       ARCH_FORMAT="unknown"
     fi
   fi
-  
+
+  # If it's a compressed format, verify if it's actually a tar archive
+  if [[ "$ARCH_FORMAT" == "gz" ]] || [[ "$ARCH_FORMAT" == "zst" ]]; then
+    T_CMD=""
+    [[ "$ARCH_FORMAT" == "gz" ]] && T_CMD="gzip -dc" || T_CMD="zstd -dc"
+    # Use tar -t to see if it's a valid tarball without extracting
+    if ! $T_CMD "$ARCH" 2>/dev/null | tar -t >/dev/null 2>&1; then
+      diag "[RESTORE] Archive has compressed extension but is not a tarball. Treating as raw compressed image."
+      ARCH_FORMAT="raw_compressed"
+    fi
+  fi
+
   diag "[RESTORE] Detected archive format: $ARCH_FORMAT"
-  
+
   # Extract based on detected format
   case "$ARCH_FORMAT" in
     "zst")
@@ -1655,6 +1661,9 @@ else
       if tar --no-same-owner -xf "$ARCH" -C "$TMPDIR" 2>&1 | { [ "$VERBOSE" = "yes" ] && cat || cat >/dev/null; }; then
         ARCH_IS_TAR=yes
       fi
+      ;;
+    "raw_compressed")
+      ARCH_IS_TAR=no
       ;;
     *)
       # Fallback: try different methods
