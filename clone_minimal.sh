@@ -1169,7 +1169,7 @@ ensure_commands() {
     PKG_FOR_CMD[sgdisk]="gptfdisk"
     PKG_FOR_CMD[partclone.extfs]="partclone"
     PKG_FOR_CMD[partclone.btrfs]="partclone"
-    PKG_FOR_CMD[ntfsclone]="ntfs-3g"
+    PKG_FOR_CMD[ntfsclone]="ntfsprogs"
     PKG_FOR_CMD[tune2fs]="e2fsprogs"
     PKG_FOR_CMD[e2fsck]="e2fsprogs"
     PKG_FOR_CMD[resize2fs]="e2fsprogs"
