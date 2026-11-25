@@ -310,13 +310,14 @@ psize_to_bytes() {
   if command -v numfmt >/dev/null 2>&1; then
     numfmt --from=iec "$s" 2>/dev/null || echo 0
   else
-    case "$s" in
-      *T*|[tT]) echo $(( $(echo "$s" | tr -d 'TtGGMmkKbB ') * 1024 * 1024 * 1024 * 1024 )) ;;
-      *G*|[gG]) echo $(( $(echo "$s" | tr -d 'TtGGMmkKbB ') * 1024 * 1024 * 1024 )) ;;
-      *M*|[mM]) echo $(( $(echo "$s" | tr -d 'TtGGMmkKbB ') * 1024 * 1024 )) ;;
-      *K*|[kK]) echo $(( $(echo "$s" | tr -d 'TtGGMmkKbB ') * 1024 )) ;;
-      *)        echo "$s" 2>/dev/null || echo 0 ;;
-    esac
+    awk -v s="$s" 'BEGIN {
+      v=s+0; u=toupper(s); mult=1
+      if (u ~ /T/) mult=1024^4
+      else if (u ~ /G/) mult=1024^3
+      else if (u ~ /M/) mult=1024^2
+      else if (u ~ /K/) mult=1024
+      printf "%.0f\n", v*mult
+    }'
   fi
 }
 
@@ -517,10 +518,10 @@ dd_compress() {
   if [ $rc -eq 0 ] && [ -s "$outfile" ]; then
     local sz
     sz=$(stat -c %s "$outfile" 2>/dev/null || echo 0)
-    echo -e "$PNAME\t${manifest_tool}\tOK\t${sz}" >> "$STATUS_LOG"
+    printf "%s\t%s\tOK\t%s\n" "$PNAME" "$manifest_tool" "$sz" >> "$STATUS_LOG"
     diag "[ARCH] Done: $PNAME via ${manifest_tool} (size=$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz B"))"
   else
-    echo -e "$PNAME\t${manifest_tool}\tFAIL\t0" >> "$STATUS_LOG"
+    printf "%s\t%s\tFAIL\t0\n" "$PNAME" "$manifest_tool" >> "$STATUS_LOG"
     echo "[ARCH] FAIL: $PNAME via ${manifest_tool} (rc=$rc)" >&2
   fi
   rm -f "$tmpstatus"
@@ -591,44 +592,44 @@ archive_partition() {
   case "$fstype" in
     ext4)
       if command -v partclone.extfs >/dev/null 2>&1 && [ "$is_mounted" = "no" ]; then
-        echo -e "$PNAME\text4\tpartclone" >> "$MANIFEST"
+        printf "%s\text4\tpartclone\n" "$PNAME" >> "$MANIFEST"
         dd_compress 'partclone.extfs -c -s '"$dev"' -o -' "zst" "$is_mounted" "$dev" "$outbase" "ext4" "partclone" && return 0
         # Retry with gzip if zst failed
         dd_compress 'partclone.extfs -c -s '"$dev"' -o -' "gz" "$is_mounted" "$dev" "$outbase" "ext4" "partclone" && return 0
         # Fallback to dd
-        echo -e "$PNAME\text4\tdd" >> "$MANIFEST"
+        printf "%s\text4\tdd\n" "$PNAME" >> "$MANIFEST"
         dd_compress "" "none" "$is_mounted" "$dev" "$outbase" "ext4" "dd" && return 0
       else
-        echo -e "$PNAME\text4\tdd" >> "$MANIFEST"
+        printf "%s\text4\tdd\n" "$PNAME" >> "$MANIFEST"
         dd_compress "" "none" "$is_mounted" "$dev" "$outbase" "ext4" "dd" && return 0
       fi
       ;;
     btrfs)
       if command -v partclone.btrfs >/dev/null 2>&1 && [ "$is_mounted" = "no" ]; then
-        echo -e "$PNAME\tbtrfs\tpartclone" >> "$MANIFEST"
+        printf "%s\tbtrfs\tpartclone\n" "$PNAME" >> "$MANIFEST"
         dd_compress 'partclone.btrfs -c -s '"$dev"' -o -' "zst" "$is_mounted" "$dev" "$outbase" "btrfs" "partclone" && return 0
         dd_compress 'partclone.btrfs -c -s '"$dev"' -o -' "gz" "$is_mounted" "$dev" "$outbase" "btrfs" "partclone" && return 0
-        echo -e "$PNAME\tbtrfs\tdd" >> "$MANIFEST"
+        printf "%s\tbtrfs\tdd\n" "$PNAME" >> "$MANIFEST"
         dd_compress "" "none" "$is_mounted" "$dev" "$outbase" "btrfs" "dd" && return 0
       else
-        echo -e "$PNAME\tbtrfs\tdd" >> "$MANIFEST"
+        printf "%s\tbtrfs\tdd\n" "$PNAME" >> "$MANIFEST"
         dd_compress "" "none" "$is_mounted" "$dev" "$outbase" "btrfs" "dd" && return 0
       fi
       ;;
     ntfs)
       if command -v ntfsclone >/dev/null 2>&1; then
-        echo -e "$PNAME\tntfs\tntfsclone" >> "$MANIFEST"
+        printf "%s\tntfs\tntfsclone\n" "$PNAME" >> "$MANIFEST"
         dd_compress "ntfsclone --save-image --output - $dev" "zst" "no" "$dev" "$outbase" "ntfs" "ntfsclone" && return 0
         dd_compress "ntfsclone --save-image --output - $dev" "gz" "no" "$dev" "$outbase" "ntfs" "ntfsclone" && return 0
-        echo -e "$PNAME\tntfs\tdd" >> "$MANIFEST"
+        printf "%s\tntfs\tdd\n" "$PNAME" >> "$MANIFEST"
         dd_compress "" "none" "$is_mounted" "$dev" "$outbase" "ntfs" "dd" && return 0
       else
-        echo -e "$PNAME\tntfs\tdd" >> "$MANIFEST"
+        printf "%s\tntfs\tdd\n" "$PNAME" >> "$MANIFEST"
         dd_compress "" "none" "$is_mounted" "$dev" "$outbase" "ntfs" "dd" && return 0
       fi
       ;;
     *)
-      echo -e "$PNAME\t${fstype:-unknown}\tdd" >> "$MANIFEST"
+      printf "%s\t%s\tdd\n" "$PNAME" "${fstype:-unknown}" >> "$MANIFEST"
       dd_compress "" "none" "$is_mounted" "$dev" "$outbase" "${fstype:-unknown}" "dd" && return 0
       ;;
   esac
@@ -1403,8 +1404,8 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     echo "No mounted destinations found. Please mount a drive and retry."; exit 1
   fi
   for i in "${!MOUNTED[@]}"; do
-    DN=$(echo -e "${MOUNTED[$i]}" | awk -F'\t' '{print $1}')
-    MP=$(echo -e "${MOUNTED[$i]}" | awk -F'\t' '{print $2}')
+    DN=$(printf '%s\n' "${MOUNTED[$i]}" | awk -F'\t' '{print $1}')
+    MP=$(printf '%s\n' "${MOUNTED[$i]}" | awk -F'\t' '{print $2}')
     FREE=$(df -hP "$MP" 2>/dev/null | awk 'NR==2{print $4}')
     echo "[$((i+1))] /dev/$DN mounted at $MP  free=$FREE"
   done
@@ -1413,7 +1414,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   if [[ "$DSTSAVE_IDX" =~ ^[0-9]+$ ]]; then
     DSTSAVE_IDX=$((DSTSAVE_IDX-1))
     if [ "$DSTSAVE_IDX" -lt 0 ] || [ "$DSTSAVE_IDX" -ge ${#MOUNTED[@]} ]; then echo "ERROR: selection out of range"; exit 1; fi
-    ARCH_DIR=$(echo -e "${MOUNTED[$DSTSAVE_IDX]}" | awk -F'\t' '{print $2}')
+    ARCH_DIR=$(printf '%s\n' "${MOUNTED[$DSTSAVE_IDX]}" | awk -F'\t' '{print $2}')
   else
     # Enable readline so TAB completes filesystem paths
     read -e -p "Enter a directory path to save the archive (must exist): " ARCH_DIR
@@ -1616,6 +1617,26 @@ else
   echo "Restore image:                                  $ARCH"
 fi
 
+# Boot-disk detection
+ROOT_DEV=$(findmnt -no SOURCE / 2>/dev/null || true)
+BOOT_DISK=""
+if [ -n "$ROOT_DEV" ]; then
+  BOOT_DISK=$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null || true)
+  [ -n "$BOOT_DISK" ] && BOOT_DISK="/dev/$BOOT_DISK"
+fi
+if [ -n "$BOOT_DISK" ]; then
+  if [ "${SRC:-}" = "$BOOT_DISK" ]; then
+    echo ""
+    echo "WARNING: SOURCE is the BOOT DISK ($BOOT_DISK). Archiving/cloning a live system may be inconsistent."
+    echo ""
+  fi
+  if [ "${DST:-}" = "$BOOT_DISK" ]; then
+    echo ""
+    echo "WARNING: TARGET is the BOOT DISK ($BOOT_DISK). This will destroy the running system."
+    echo ""
+  fi
+fi
+
 PROCEED_EST=$(read_yes_no "Proceed with operation given the estimates above? (y/N): ")
 [[ "$PROCEED_EST" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
 
@@ -1660,7 +1681,7 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
       TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX")
     fi
     cleanup_tmp() { [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && rm -rf "$TMPDIR"; }
-    trap 'cleanup_tmp' EXIT INT TERM HUP
+    trap 'restore_readahead; cleanup_tmp' EXIT INT TERM HUP
     diag "[ARCH] Using temp workspace: $TMPDIR"
     MANIFEST="$TMPDIR/manifest.tsv"
     STATUS_LOG="$TMPDIR/status.tsv"
@@ -1673,9 +1694,9 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     PART_NUM=0
     PART_TOTAL=${#APARTS[@]}
     for line in "${APARTS[@]}"; do
-      PNAME=$(echo -e "$line" | awk -F"\t" '{print $1}')
-      FST=$(echo -e   "$line" | awk -F"\t" '{print $2}')
-      PSIZE=$(echo -e  "$line" | awk -F"\t" '{print $3}')
+      PNAME=$(printf '%s\n' "$line" | awk -F"\t" '{print $1}')
+      FST=$(printf '%s\n' "$line" | awk -F"\t" '{print $2}')
+      PSIZE=$(printf '%s\n' "$line" | awk -F"\t" '{print $3}')
       DEV="/dev/$PNAME"
       OUTBASE="$TMPDIR/part-${PNAME}"
       PART_NUM=$((PART_NUM + 1))
@@ -1722,9 +1743,9 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
     PKG_LIST=$(mktemp -p "$TMPDIR" .pkglist.XXXXXX)
     (cd "$TMPDIR" && find . -maxdepth 1 -type f -printf "%P\n" > "$PKG_LIST")
     if [ ${#TAR_COMP_FLAG[@]} -gt 0 ]; then
-      (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" --remove-files -T "$PKG_LIST")
+      (cd "$TMPDIR" && tar "${TAR_COMP_FLAG[@]}" -cf "$ARCH_TAR" -T "$PKG_LIST")
     else
-      (cd "$TMPDIR" && tar -cf "$ARCH_TAR" --remove-files -T "$PKG_LIST")
+      (cd "$TMPDIR" && tar -cf "$ARCH_TAR" -T "$PKG_LIST")
     fi
     rm -f "$PKG_LIST" || true
     mv -f "$ARCH_TAR" "$ARCH" 2>/dev/null || true
@@ -1924,7 +1945,7 @@ else
       echo "[RESTORE] Kept temp workspace for diagnostics: $TMPDIR" >&2
     fi
   }
-  trap 'cleanup_tmp' EXIT INT TERM HUP
+  trap 'restore_readahead; cleanup_tmp' EXIT INT TERM HUP
 
   if [ "$ARCH_IS_TAR" = "yes" ]; then
     # Decide on partial restore now that archive is extracted and manifest is available
@@ -1934,6 +1955,16 @@ else
         PARTIAL_RESTORE=yes
         echo "You chose partial restore. Partition table will NOT be modified."
         echo "Ensure the target already has the desired partitions present."
+      fi
+    fi
+
+    # Capacity check: ensure target can hold all archived partitions.
+    if [ "${PARTIAL_RESTORE:-no}" != "yes" ] && [ -f "$TMPDIR/partition_table.sfdisk" ]; then
+      NEED_SECTORS=$(awk -F, '/^\/dev\// {for(i=1;i<=NF;i++) if($i ~ /size=/){gsub(/[^0-9]/,"",$i); s+=$i}} END{print s+0}' "$TMPDIR/partition_table.sfdisk")
+      DST_SECTORS=$(blockdev --getsz "$DST" 2>/dev/null || echo 0)
+      if [ -n "$NEED_SECTORS" ] && [ "$NEED_SECTORS" -gt 0 ] && [ "$DST_SECTORS" -gt 0 ] && [ "$NEED_SECTORS" -gt "$DST_SECTORS" ]; then
+        ui_error "Target ($DST_SECTORS sectors) is smaller than archived partitions ($NEED_SECTORS sectors)."
+        exit 1
       fi
     fi
 
@@ -2444,8 +2475,8 @@ if [[ "$OP" =~ ^[CcRr]$ ]]; then
     if [[ "$GROW" =~ ^[Yy]$ ]]; then
       mapfile -t TGT_GROWABLE < <(lsblk -ln -o NAME,FSTYPE "$DST" 2>/dev/null | awk '$2=="ext4" || $2=="btrfs" {print $1"\t"$2}')
       if [ ${#TGT_GROWABLE[@]} -eq 1 ]; then
-        TP_NAME=$(echo -e "${TGT_GROWABLE[0]}" | awk -F'\t' '{print $1}')
-        TP_FS=$(echo -e "${TGT_GROWABLE[0]}" | awk -F'\t' '{print $2}')
+        TP_NAME=$(printf '%s\n' "${TGT_GROWABLE[0]}" | awk -F'\t' '{print $1}')
+        TP_FS=$(printf '%s\n' "${TGT_GROWABLE[0]}" | awk -F'\t' '{print $2}')
         TP="/dev/${TP_NAME}"
         echo "=== Growing $TP (fs=$TP_FS) to fill its partition ==="
         mount | awk -v p="$TP" '$1 == p {print $3}' | xargs -r -n1 umount || true
