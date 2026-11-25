@@ -316,7 +316,6 @@ elif [[ "$OP" =~ ^[Rr]$ ]]; then
 fi
 
 # Safety: detect if SOURCE is the current system disk (boot volume)
-BOOT_DISK=$(diskutil info / 2>/dev/null | awk -F: '/Part of Whole:/ {gsub(/^ *| *$/,"",$2); print "/dev/"$2; exit}')
 LIVE_ON_SOURCE=0
 if [ -n "$BOOT_DISK" ] && [ "$SRC" = "$BOOT_DISK" ]; then
   LIVE_ON_SOURCE=1
