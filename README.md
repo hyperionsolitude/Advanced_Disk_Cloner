@@ -18,6 +18,7 @@ Single-file, menu-driven disk cloner/archiver/restorer optimized for Linux live 
 - Clean output (non-verbose): progress bars, concise steps, total runtime summary
 - Path UX: TAB completion + prompts anchored to chosen mountpoints
 - Auto-install on Ubuntu of required tools; self-test mode
+- Safety: boot-disk detection and warning, target capacity check before restore, readahead restored on exit, temp kept on failure for diagnostics
 
 ## Why it boots Windows reliably
 - On restore, the script preserves original disk GUID and per-partition PARTUUIDs, keeping Windows BCD device references consistent when the clone is used standalone. If both original and clone will be attached at the same time, choose GUID randomization and then repair BCD externally (WinRE `bcdboot`).
