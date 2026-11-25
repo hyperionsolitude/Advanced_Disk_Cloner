@@ -21,14 +21,64 @@
 
 set -euo pipefail
 
-# Verbosity control: pass -v or --verbose to enable diagnostic logs
+# Argument parsing
 VERBOSE=no
-for __arg in "$@"; do
-  case "$__arg" in
-    -v|--verbose) VERBOSE=yes ;;
+DRY_RUN=no
+YES=no
+SRC_ARG=""
+OP_ARG=""
+DST_ARG=""
+ARCH_ARG=""
+PARTIAL_ARG=""
+COMPACT_ARG=""
+HELP=no
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -v|--verbose) VERBOSE=yes; shift ;;
+    -h|--help) HELP=yes; shift ;;
+    --dry-run) DRY_RUN=yes; shift ;;
+    -y|--yes) YES=yes; shift ;;
+    --src) SRC_ARG="${2:-}"; shift 2 ;;
+    --op) OP_ARG="${2:-}"; shift 2 ;;
+    --dst) DST_ARG="${2:-}"; shift 2 ;;
+    --archive) ARCH_ARG="${2:-}"; shift 2 ;;
+    --partial) PARTIAL_ARG="${2:-}"; shift 2 ;;
+    --compact) COMPACT_ARG="yes"; shift ;;
+    *) echo "Unknown option: $1" >&2; HELP=yes; shift ;;
   esac
 done
 diag() { if [ "$VERBOSE" = "yes" ]; then echo "$@" >&2; fi }
+
+print_help() {
+  cat <<'EOF'
+Advanced Disk Cloner - macOS Edition
+
+Usage: sudo ./adc_macos.sh [options]
+
+Options:
+  -v, --verbose          Enable diagnostic logs
+  -h, --help             Show this help
+  --dry-run              Print what would happen without doing it
+  -y, --yes              Auto-confirm destructive prompts
+  --src N                Source disk number (from the menu)
+  --op C|A|R             Operation: Clone, Archive, Restore
+  --dst N                Target disk number (from the menu)
+  --archive PATH         Archive file path (for A/R)
+  --partial "1,3-5"      Partitions to restore (partial restore)
+  --compact              Compact restore (pack partitions contiguously)
+
+Interactive mode (default): run with no options and follow the prompts.
+
+Examples:
+  sudo ./adc_macos.sh
+  sudo ./adc_macos.sh --src 1 --op A --archive ~/Desktop/disk0.tar.gz -y
+  sudo ./adc_macos.sh --src 1 --op R --dst 2 --archive ./disk0.tar.gz --partial "1,3-5" -y
+  sudo ./adc_macos.sh --dry-run --src 1 --op A
+
+License: MIT
+EOF
+}
+if [ "$HELP" = "yes" ]; then print_help; exit 0; fi
 
 # Timer functions for operation tracking (excludes user interaction time)
 OP_START_TIME=""
@@ -58,7 +108,7 @@ HAS_ZSTD=no; command -v zstd >/dev/null 2>&1 && HAS_ZSTD=yes || true
 # Detect Apple Silicon for optimizations
 IS_APPLE_SILICON=no
 CHIP_NAME=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "")
-if [[ "$CHIP_NAME" =~ "Apple" ]]; then
+if [ "$(uname -m)" = "arm64" ]; then
   IS_APPLE_SILICON=yes
   # Apple Silicon optimizations: use performance cores for compression
   PERF_CORES=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo "$THREADS")
@@ -169,19 +219,35 @@ read_yes_no() {
       echo "$ans"
       return 0
     fi
-    echo "Please answer Y or N."
+    echo "Please answer Y or N." >&2
   done
 }
 
 # List candidate whole disks using diskutil. Prefer entries from the '0:' line (whole-disk row).
-mapfile -t DISKS < <(diskutil list | awk '/^ *0:/{print $NF}' | sort -u | sed 's#^#/dev/#')
+# Prefer physical disks (filter out synthesized APFS container disks).
+DISKS=()
+while IFS= read -r _d; do [ -n "$_d" ] && DISKS+=("$_d"); done < <(diskutil list | awk '/^\/dev\/disk[0-9]+/ {dev=$1; phys=($0 ~ /physical/)} /^ *0:/ && phys {print dev}' | sort -u)
 if [ ${#DISKS[@]} -eq 0 ]; then
-  # Fallback: any /dev/diskN headers
-  mapfile -t DISKS < <(diskutil list | awk '/^\/dev\/disk[0-9]+/ {print $1}')
+  DISKS=()
+  while IFS= read -r _d; do [ -n "$_d" ] && DISKS+=("$_d"); done < <(diskutil list | awk '/^ *0:/{print $NF}' | sort -u | sed 's#^#/dev/#')
+fi
+if [ ${#DISKS[@]} -eq 0 ]; then
+  DISKS=()
+  while IFS= read -r _d; do [ -n "$_d" ] && DISKS+=("$_d"); done < <(diskutil list | awk '/^\/dev\/disk[0-9]+/ {print $1}')
 fi
 if [ ${#DISKS[@]} -eq 0 ]; then
   echo "[macOS] No disks found via diskutil."; exit 1
 fi
+
+# Resolve physical boot disk early (used to mark the menu and warn later).
+BOOT_DISK=$(diskutil info / 2>/dev/null | awk -F: '
+  /APFS Physical Store:/ { store=$2 }
+  /Part of Whole:/ { whole=$2 }
+  END {
+    gsub(/^ *| *$/, "", store); gsub(/^ *| *$/, "", whole)
+    if (store != "") { sub(/s[0-9]+$/, "", store); print "/dev/" store }
+    else { print "/dev/" whole }
+  }')
 
 # Pretty-print with size/model
 echo "=== Available Disks (macOS) ==="
@@ -190,18 +256,20 @@ for i in "${!DISKS[@]}"; do
   SZ_H=$(diskutil info "$D" 2>/dev/null | awk -F':' '/^ *Disk Size:/ {gsub(/^ *| *$/,"",$2); sub(/ \(.*/,"",$2); print $2; exit}')
   [ -n "$SZ_H" ] || SZ_H="?"
   MD=$(diskutil info "$D" 2>/dev/null | awk -F':' '/^ *Device Location:/ {gsub(/^ *| *$/,"",$2); print $2; exit}')
-  echo "[$((i+1))] $D  size=$SZ_H  location=${MD:-?}"
+  TAG=""
+  [ "$D" = "$BOOT_DISK" ] && TAG="  <-- BOOT DISK"
+  echo "[$((i+1))] $D  size=$SZ_H  location=${MD:-?}${TAG}"
 done
 echo ""
 
-read -rp "Select SOURCE number: " SRC_IDX
-read -rp "Operation: [C]lone to device, [A]rchive image, or [R]estore from image? (C/A/R): " OP
+if [ -n "$SRC_ARG" ]; then SRC_IDX="$SRC_ARG"; else read -rp "Select SOURCE number: " SRC_IDX; fi
+if [ -n "$OP_ARG" ]; then OP="$OP_ARG"; else read -rp "Operation: [C]lone to device, [A]rchive image, or [R]estore from image? (C/A/R): " OP; fi
 OP=${OP:-C}
 if [[ ! "$OP" =~ ^[CcAaRr]$ ]]; then echo "Invalid choice"; exit 1; fi
 
 DST_IDX=-1
 if [[ "$OP" =~ ^[Cc]$ ]]; then
-  read -rp "Select TARGET number: " DST_IDX
+  if [ -n "$DST_ARG" ]; then DST_IDX="$DST_ARG"; else read -rp "Select TARGET number: " DST_IDX; fi
 fi
 
 if ! [[ "$SRC_IDX" =~ ^[0-9]+$ ]]; then echo "ERROR: source selection must be a number"; exit 1; fi
@@ -221,7 +289,7 @@ if [[ "$OP" =~ ^[Cc]$ ]] && [ "$SRC" = "$DST" ]; then echo "ERROR: SOURCE and TA
 # Helper: extract bytes from diskutil info's parentheses on Disk Size line
 mac_bytes() {
   local dev="$1"
-  diskutil info "$dev" 2>/dev/null | awk -F'[()]' '/^ *Disk Size:/ {gsub(/ Bytes/,"",$2); gsub(/,/,"",$2); if($2~^[0-9]+$) {print $2; exit}} END{if(NR==0) print 0}'
+  diskutil info "$dev" 2>/dev/null | awk -F'[()]' '/^ *Disk Size:/ {gsub(/ Bytes/,"",$2); gsub(/,/,"",$2); if ($2 ~ /^[0-9]+$/) {print $2; exit}}' 
 }
 
 SRC_BYTES=$(mac_bytes "$SRC")
@@ -235,9 +303,13 @@ fi
 # Archive path prompt if needed
 if [[ "$OP" =~ ^[Aa]$ ]]; then
   SRC_BASENAME=$(basename "$SRC")
-  DEF_ARCH_PATH="./${SRC_BASENAME}.tar.gz"
-  read -e -p "Enter archive file name or path [default ${SRC_BASENAME}.tar.gz]: " -i "$DEF_ARCH_PATH" ARCH
-  ARCH=${ARCH:-$DEF_ARCH_PATH}
+  DEF_ARCH_PATH="$HOME/Desktop/${SRC_BASENAME}-$(date +%Y%m%d).tar.gz"
+  if [ -n "$ARCH_ARG" ]; then ARCH="$ARCH_ARG"
+  elif [ "$DRY_RUN" = "yes" ] || [ "$YES" = "yes" ]; then ARCH="$DEF_ARCH_PATH"
+  else
+    read -e -p "Enter archive file name or path [default ${DEF_ARCH_PATH}]: " ARCH
+    ARCH=${ARCH:-$DEF_ARCH_PATH}
+  fi
 elif [[ "$OP" =~ ^[Rr]$ ]]; then
   read -e -p "Enter archive image file to restore (e.g., ./disk0.tar.gz): " ARCH
   [ -f "$ARCH" ] || { echo "Archive not found: $ARCH"; exit 1; }
@@ -264,24 +336,51 @@ if [ "$LIVE_ON_SOURCE" -eq 1 ]; then
   echo "    - Boot from external USB with macOS installer"
   echo "    - Use Target Disk Mode from another Mac"
   echo ""
-  read -rp "Proceed with READ-ONLY archiving of live system anyway? (y/N): " PROCEED_LIVE
+  if [ "$YES" = "yes" ] || [ "$DRY_RUN" = "yes" ]; then PROCEED_LIVE="Y"
+  else read -rp "Proceed with READ-ONLY archiving of live system anyway? (y/N): " PROCEED_LIVE; fi
   [[ "$PROCEED_LIVE" =~ ^[Yy]$ ]] || { echo "Cancelled"; exit 1; }
 fi
 
 if [[ "$OP" =~ ^[Cc]$ ]]; then
+  if [ -n "${BOOT_DISK:-}" ] && [ "$DST" = "$BOOT_DISK" ]; then
+    echo ""
+    echo "WARNING: TARGET is the BOOT DISK (contains running macOS). This will destroy the running system."
+    echo ""
+  fi
   echo "TARGET: $DST (WILL BE ERASED)"
-  read -rp "Type YES to confirm clone: " CONFIRM; [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
+  if [ "$YES" = "yes" ]; then CONFIRM="YES"; else read -rp "Type YES to confirm clone: " CONFIRM; fi
+  [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
 elif [[ "$OP" =~ ^[Rr]$ ]]; then
   echo "TARGET: select next"
   echo "=== Available Disks (restore target) ==="
   for i in "${!DISKS[@]}"; do
     D="${DISKS[$i]}"; SZ_H=$(diskutil info "$D" 2>/dev/null | awk -F':' '/^ *Disk Size:/ {gsub(/^ *| *$/,"",$2); sub(/ \(.*/,"",$2); print $2; exit}'); [ -n "$SZ_H" ] || SZ_H="?"; echo "[$((i+1))] $D  size=$SZ_H"
   done
-  read -rp "Select TARGET number for restore: " DST_IDX
+  if [ -n "$DST_ARG" ]; then DST_IDX="$DST_ARG"; else read -rp "Select TARGET number for restore: " DST_IDX; fi
   DST_IDX=$((DST_IDX-1))
   if [ "$DST_IDX" -lt 0 ] || [ "$DST_IDX" -ge ${#DISKS[@]} ]; then echo "ERROR: target selection out of range"; exit 1; fi
   DST="${DISKS[$DST_IDX]}"
-  echo "TARGET: $DST (WILL BE ERASED)"; read -rp "Type YES to confirm restore: " CONFIRM; [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
+  if [ -n "${BOOT_DISK:-}" ] && [ "$DST" = "$BOOT_DISK" ]; then
+    echo ""
+    echo "WARNING: TARGET is the BOOT DISK (contains running macOS). This will destroy the running system."
+    echo ""
+  fi
+  echo "TARGET: $DST (WILL BE ERASED)"
+  if [ "$YES" = "yes" ]; then CONFIRM="YES"; else read -rp "Type YES to confirm restore: " CONFIRM; fi
+  [ "$CONFIRM" = "YES" ] || { echo "Cancelled"; exit 1; }
+fi
+
+# Dry run: print plan and exit
+if [ "$DRY_RUN" = "yes" ]; then
+  echo "=== DRY RUN (no changes made) ==="
+  echo "SOURCE: $SRC"
+  echo "OPERATION: $OP"
+  [ -n "${DST:-}" ] && echo "TARGET: $DST"
+  [ -n "${ARCH:-}" ] && echo "ARCHIVE: $ARCH"
+  [ -n "${PARTIAL_ARG:-}" ] && echo "PARTIAL: $PARTIAL_ARG"
+  [ "$COMPACT_ARG" = "yes" ] && echo "COMPACT: yes"
+  echo "VERBOSE: $VERBOSE"
+  exit 0
 fi
 
 # Unmount target if applicable
@@ -317,21 +416,22 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   MANIFEST="$TMPDIR/manifest.tsv"; : > "$MANIFEST"
   # Save GPT and diskutil diagnostics
   (diskutil list "$SRC" || true) > "$TMPDIR/diskutil_list.txt"
-  (gpt -r show "$SRC" || true) > "$TMPDIR/gpt_show.txt"
+  (run_root gpt -r show "$SRC" || true) > "$TMPDIR/gpt_show.txt"
   # Build map of start/size by index via gpt -r show (columns: start size index ...)
   # store as: idx start size
-  (awk 'NF>=3 && $3 ~ /^[0-9]+$/ {print $3"\t"$1"\t"$2}' "$TMPDIR/gpt_show.txt" | sort -n) > "$TMPDIR/gpt_map.tsv"
+  (awk 'NF>=4 && $3 ~ /^[0-9]+$/ {print $3"\t"$1"\t"$2"\t"$NF}' "$TMPDIR/gpt_show.txt" | sort -n) > "$TMPDIR/gpt_map.tsv"
   # Enumerate partitions for SRC
-  mapfile -t PARTS < <(diskutil list "$SRC" | awk '$NF ~ /^disk[0-9]+s[0-9]+$/ {print $NF}' )
+  PARTS=()
+  while IFS= read -r _p; do [ -n "$_p" ] && PARTS+=("$_p"); done < <(diskutil list "$SRC" | awk '$NF ~ /^disk[0-9]+s[0-9]+$/ {print $NF}')
   total=${#PARTS[@]}; num=0
   for ident in "${PARTS[@]}"; do
     num=$((num+1))
     PDEV="/dev/r${ident}"  # raw device for speed
     # Determine index number from ident suffix (sN)
     IDX=$(echo "$ident" | sed -E 's/^.*s([0-9]+)$/\1/')
-    # Query Type GUID and Partition UUID
-    TYPE_GUID=$(diskutil info "/dev/${ident}" 2>/dev/null | awk -F: '/^ *Type \(GUID\):/ {gsub(/^ *| *$/,"",$2); print $2; exit}')
-    PART_UUID=$(diskutil info "/dev/${ident}" 2>/dev/null | awk -F: '/^ *Partition UUID:/ {gsub(/^ *| *$/,"",$2); print $2; exit}')
+    # Type GUID comes from gpt show (stored in gpt_map); partition UUID from diskutil
+    TYPE_GUID=$(awk -v i="$IDX" '$1==i{print $4; exit}' "$TMPDIR/gpt_map.tsv")
+    PART_UUID=$(diskutil info "/dev/${ident}" 2>/dev/null | awk -F: '/^ *Disk \/ Partition UUID:/ {gsub(/^ *| *$/,"",$2); print $2; exit}')
     START=$(awk -v i="$IDX" '$1==i{print $2; exit}' "$TMPDIR/gpt_map.tsv")
     SIZE=$(awk -v i="$IDX" '$1==i{print $3; exit}' "$TMPDIR/gpt_map.tsv")
       progress_msg "[$num/$total] Archiving ${ident}..."
@@ -348,41 +448,43 @@ elif [[ "$OP" =~ ^[Aa]$ ]]; then
   # Package to tar with optimized compression
   progress_msg "Packaging archive..."
   TARFILE="$ARCH"
-  if [ "$HAS_ZSTD" = "yes" ]; then
-    (cd "$TMPDIR" && tar -I "zstd -T${COMP_THREADS} -3" -cf "$TARFILE" manifest.tsv gpt_show.txt diskutil_list.txt *.raw.*)
-  elif [ "$HAS_PIGZ" = "yes" ]; then
-    (cd "$TMPDIR" && tar -I "pigz -3 -p ${COMP_THREADS}" -cf "$TARFILE" manifest.tsv gpt_show.txt diskutil_list.txt *.raw.*)
-  else
-    (cd "$TMPDIR" && tar -czf "$TARFILE" manifest.tsv gpt_show.txt diskutil_list.txt *.raw.*)
-  fi
+  (cd "$TMPDIR" && tar -cf "$TARFILE" manifest.tsv gpt_show.txt diskutil_list.txt *.raw.*)
   echo "=== Done ==="; show_op_time; echo "Archived $SRC to $ARCH successfully."; exit 0
 else
   echo "=== Start restore (per-partition): $ARCH → $DST ==="
   # Extract archive with optimized decompression
   ARCH_DIRNAME=$(dirname "$ARCH"); if [ -n "${ADC_TMPDIR:-}" ]; then TMPDIR="$ADC_TMPDIR"; mkdir -p "$TMPDIR"; else TMPDIR=$(mktemp -d "${ARCH_DIRNAME%/}/.adc_tmp.XXXXXX"); fi
   diag "[RESTORE] Using temp workspace: $TMPDIR"; export TMPDIR
-  if [ "$HAS_ZSTD" = "yes" ]; then
-    tar -I "zstd -T${COMP_THREADS} -d" -xf "$ARCH" -C "$TMPDIR"
-  elif [ "$HAS_PIGZ" = "yes" ]; then
-    tar -I "pigz -d -p ${COMP_THREADS}" -xf "$ARCH" -C "$TMPDIR"
-  else
-    tar -xzf "$ARCH" -C "$TMPDIR"
-  fi
+  tar -xf "$ARCH" -C "$TMPDIR"
   [ -f "$TMPDIR/manifest.tsv" ] || { echo "ERROR: manifest.tsv missing in archive"; exit 1; }
+  DST_BYTES=$(mac_bytes "$DST")
+  NEED_BYTES=$(awk '{s+=$6} END{print s*512}' "$TMPDIR/manifest.tsv")
+  if [ -n "$NEED_BYTES" ] && [ "$NEED_BYTES" -gt "$DST_BYTES" ]; then
+    echo "ERROR: Target ($DST_BYTES bytes) is smaller than archived partitions ($NEED_BYTES bytes)."
+    exit 1
+  fi
   # Ask for partial restore
-  PR=$(read_yes_no "Partial restore: restore only selected partitions? (y/N): ")
-  PARTIAL=no; declare -A SEL
-  if [[ "$PR" =~ ^[Yy]$ ]]; then
+  PARTIAL=no; SEL=""
+  if [ -n "$PARTIAL_ARG" ]; then
     PARTIAL=yes
-    echo "Available partitions in archive (idx ident):"
-    awk '{print $2"\t"$1}' "$TMPDIR/manifest.tsv"
-    read -rp "Enter partition numbers to restore (comma-separated, ranges ok e.g. 1,3-5): " __SEL
+    __SEL="$PARTIAL_ARG"
+  else
+    PR=$(read_yes_no "Partial restore: restore only selected partitions? (y/N): ")
+    if [[ "$PR" =~ ^[Yy]$ ]]; then
+      PARTIAL=yes
+      echo "Available partitions in archive (idx ident):"
+      awk '{print $2"\t"$1}' "$TMPDIR/manifest.tsv"
+      read -rp "Enter partition numbers to restore (comma-separated, ranges ok e.g. 1,3-5): " __SEL
+    fi
+  fi
+  if [ "$PARTIAL" = "yes" ]; then
     IFS=',' read -r -a __ARR <<< "$__SEL"
     for tok in "${__ARR[@]}"; do
       t=$(echo "$tok" | sed 's/^ *//;s/ *$//')
-      if [[ "$t" =~ ^[0-9]+-[0-9]+$ ]]; then a=$(echo "$t"|cut -d- -f1); b=$(echo "$t"|cut -d- -f2); if [ "$a" -le "$b" ]; then for ((j=a;j<=b;j++)); do SEL[$j]=1; done; fi; elif [[ "$t" =~ ^[0-9]+$ ]]; then SEL[$t]=1; fi
+      if [[ "$t" =~ ^[0-9]+-[0-9]+$ ]]; then a=$(echo "$t"|cut -d- -f1); b=$(echo "$t"|cut -d- -f2); if [ "$a" -le "$b" ]; then for ((j=a;j<=b;j++)); do SEL="$SEL $j"; done; fi
+      elif [[ "$t" =~ ^[0-9]+$ ]]; then SEL="$SEL $t"; fi
     done
-    [ ${#SEL[@]} -gt 0 ] || { echo "No valid selections; cancelling."; exit 1; }
+    [ -n "$SEL" ] || { echo "No valid selections; cancelling."; exit 1; }
     echo "You chose partial restore. Partition table will NOT be modified."
   fi
   # Recreate GPT if not partial
@@ -391,10 +493,15 @@ else
     run_root gpt destroy -f "$DST" >/dev/null 2>&1 || true
     run_root gpt create -f "$DST"
     # Preserve original starts/sizes by default; optional compact
-    CM=$(read_yes_no "Compact restore: pack partitions contiguously (preserve numbers)? (y/N): ")
-    COMPACT=no; [[ "$CM" =~ ^[Yy]$ ]] && COMPACT=yes
+    if [ "$COMPACT_ARG" = "yes" ]; then COMPACT=yes
+    elif [ "$YES" = "yes" ]; then COMPACT=no
+    else
+      CM=$(read_yes_no "Compact restore: pack partitions contiguously (preserve numbers)? (y/N): ")
+      COMPACT=no; [[ "$CM" =~ ^[Yy]$ ]] && COMPACT=yes
+    fi
     # Build arrays from manifest: ident idx type_guid part_uuid start size
-    mapfile -t LINES < "$TMPDIR/manifest.tsv"
+    LINES=()
+  while IFS= read -r _l || [ -n "$_l" ]; do LINES+=("$_l"); done < "$TMPDIR/manifest.tsv"
     # Determine first usable LBA on target (approx 40); fall back to 40
     FIRST_LBA=40
     # Recreate entries
@@ -410,14 +517,16 @@ else
       # Some archives may lack type GUID; fallback to Apple_APFS if missing
       tg="$typeg"; [ -n "$tg" ] || tg="7C3457EF-0000-11AA-AA11-00306543ECAC" # Apple_APFS
       run_root gpt add -i "$idx" -t "$tg" -b "$b" -s "$s" "$DST" >/dev/null 2>&1 || true
-      if [ -n "$puid" ]; then run_root gpt add -i "$idx" -u "$puid" "$DST" >/dev/null 2>&1 || true; fi
+      if [ -n "$puid" ] && command -v sgdisk >/dev/null 2>&1; then
+        run_root sgdisk --partition-guid="${idx}:${puid}" "$DST" >/dev/null 2>&1 || true
+      fi
       if [ "$COMPACT" = "yes" ]; then NEXT_LBA=$((b + s)); fi
     done
     run_root diskutil repairDisk "$DST" >/dev/null 2>&1 || true
   fi
   # Restore partition images with optimized decompression
   while IFS=$'\t' read -r ident idx typeg puid start size tool sz; do
-    if [ "$PARTIAL" = "yes" ]; then [ -n "${SEL[$idx]:-}" ] || { diag "[RESTORE] Skip $ident (not selected)"; continue; }; fi
+    if [ "$PARTIAL" = "yes" ]; then case " $SEL " in *" $idx "*) ;; *) diag "[RESTORE] Skip $ident (not selected)"; continue;; esac; fi
     TDEV="/dev/r$(basename "$DST")s${idx}"
     BASE="$TMPDIR/part-${ident}"
     # Try both compression formats
@@ -427,7 +536,10 @@ else
     fi
     
     if [ -n "$IMGFILE" ]; then
-      if [ "$EXT" = "zst" ] && command -v zstd >/dev/null 2>&1; then
+      if [ "$EXT" = "zst" ]; then
+        if ! command -v zstd >/dev/null 2>&1; then
+          echo "ERROR: zstd is required to restore $IMGFILE (brew install zstd)"; exit 1
+        fi
         if command -v pv >/dev/null 2>&1; then
           run_root sh -c "zstd -dc -T${COMP_THREADS} \"${IMGFILE}\" | pv | dd of=\"$TDEV\" bs=$DD_BS conv=fsync status=none"
         else
@@ -452,5 +564,8 @@ else
     sync
   done < "$TMPDIR/manifest.tsv"
   run_root diskutil repairDisk "$DST" >/dev/null 2>&1 || true
+  for _ap in $(diskutil list "$DST" 2>/dev/null | awk '$2=="Apple_APFS" {print $NF}'); do
+    run_root diskutil apfs repairDisk "$_ap" >/dev/null 2>&1 || true
+  done
   echo "=== Done ==="; show_op_time; echo "Restored $ARCH to $DST successfully."; exit 0
 fi

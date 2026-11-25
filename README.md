@@ -41,10 +41,16 @@ On macOS, `clone_minimal.sh` auto-detects and delegates to `adc_macos.sh`.
   - Partial restore by partition index
 - Uses raw devices (`/dev/rdiskN`) for maximum throughput
 - **Apple Silicon optimizations:**
-  - Auto-detects M-series chips (M1/M2/M3/M4)
+  - Auto-detects M-series chips (M1/M2/M3/M4) via `uname -m` (arm64)
   - Uses performance cores for compression (efficiency cores reserved for I/O)
   - 32MB buffer sizes optimized for unified memory architecture
   - Prefers `zstd` compression (faster on ARM64 with better ratios)
+- **Apple filesystem (APFS) support:**
+  - Archives/restores physical partitions (including Apple_APFS containers) via raw dd
+  - Only physical disks are offered (synthesized APFS container disks are filtered out)
+  - Restores the APFS container and runs `diskutil apfs repairDisk` on each restored container
+  - Preserves Type GUIDs and (with `sgdisk`) partition UUIDs
+- **Known limitations on Apple Silicon:** booting macOS from a restored external disk may require additional blessing/recovery steps not handled by this script; FileVault-encrypted volumes are captured/restored encrypted (password required).
 
 ## Why it boots Windows reliably
 - On restore, the script preserves original disk GUID and per-partition PARTUUIDs, keeping Windows BCD device references consistent when the clone is used standalone. If both original and clone will be attached at the same time, choose GUID randomization and then repair BCD externally (WinRE `bcdboot`).
